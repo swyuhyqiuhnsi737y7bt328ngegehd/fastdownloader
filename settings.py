@@ -1,7 +1,9 @@
 import json
 import os
 
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'downloader_settings.json')
+from paths import data_file
+
+SETTINGS_FILE = data_file('downloader_settings.json')
 
 class Settings:
     def __init__(self):

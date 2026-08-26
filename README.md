@@ -99,6 +99,10 @@ python main.py
 | `servers.json` | 远程服务器配置（含明文密码，注意保管） |
 | `*.part` | 未完成的下载临时文件，删除即放弃续传 |
 
+> **源码运行**时上述文件位于项目根目录；
+> **打包版（onefile/standalone）** 位于 `%LOCALAPPDATA%\FastDownloader`
+> （onefile 会把代码解压到临时目录并在退出时删除，文件放那里会丢失）。
+
 ### C 兼容 API
 
 `downloader_api.h` 定义了 `dl_init / dl_create_task / dl_start_task / dl_pause_task /

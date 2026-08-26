@@ -5,7 +5,9 @@ import time
 import urllib.parse
 from curl_cffi import requests as curl_requests
 
-SERVERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'servers.json')
+from paths import data_file
+
+SERVERS_FILE = data_file('servers.json')
 
 def load_servers():
     try:

@@ -8,6 +8,8 @@ import shutil
 import tempfile
 from urllib.parse import urlparse
 
+from paths import data_file
+
 # 顶层受保护的导入：Nuitka/pyinstaller 打包时能静态扫描到这些依赖，
 # 缺包时优雅降级而不是启动崩溃（win32crypt 需 pywin32）
 try:
@@ -19,9 +21,8 @@ try:
 except ImportError:
     AES = None
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(HERE, 'download.log')
-CACHE_FILE = os.path.join(HERE, 'cookie_cache.json')
+LOG_FILE = data_file('download.log')
+CACHE_FILE = data_file('cookie_cache.json')
 
 def log(msg):
     try:

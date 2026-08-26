@@ -2,8 +2,9 @@ import os
 import time
 import json
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(HERE, 'download.log')
+from paths import data_file
+
+LOG_FILE = data_file('download.log')
 
 def log(msg):
     try:

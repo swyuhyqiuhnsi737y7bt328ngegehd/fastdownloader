@@ -4,12 +4,15 @@ import queue
 import time
 import os
 import json
+import re
 import traceback
 from collections import deque
 from browser_cookies import apply_cookies_to_session
 from playwright_handler import is_available as pw_available, resolve_cookies, apply_playwright_cookies, download_via_playwright as pw_download
 
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'download.log')
+from paths import data_file
+
+LOG_FILE = data_file('download.log')
 def log(msg):
     try:
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
@@ -408,11 +411,29 @@ class DownloadTask:
             log(f'线程{idx} HTTP={resp.status_code}')
             if resp.status_code in (403, 503, 429):
                 raise Exception('服务器拒绝了访问，请更换下载源（如 GitHub Release）或使用浏览器下载')
+            if 'Range' in headers:
+                # 服务器可能忽略/篡改 Range：直接按请求偏移写入会把数据写错位，
+                # 且大小校验不一定能发现（总长度可能恰好一致），必须显式校验。
+                if resp.status_code == 200:
+                    raise Exception('服务器不支持 Range 请求，为避免文件损坏已中止下载')
+                if resp.status_code == 206:
+                    cr = resp.headers.get('Content-Range', '')
+                    m = re.match(r'bytes\s+(\d+)-', cr or '')
+                    if m and int(m.group(1)) != start:
+                        raise Exception(
+                            f'服务器返回的区间与请求不符（期望从 {start} 开始，实际从 {m.group(1)} 开始），'
+                            f'为避免文件损坏已中止下载')
+                    if not m:
+                        log(f'线程{idx} 206 但 Content-Range 无法解析: {cr!r}')
             resp.raise_for_status()
             for chunk in resp.iter_content(chunk_size=8192):
                 if self.status != 'running' or gen != self._generation:
                     stat['status'] = 'stopped'
                     log(f'线程{idx} 停止: status={self.status}, gen={gen}')
+                    break
+                if end >= 0 and start > end:
+                    # 服务器返回的数据超出请求区间：停止写入，防止覆盖相邻线程的数据
+                    log(f'线程{idx} 数据超出区间 end={end}, 停止')
                     break
                 if self._thread_speed_limit > 0:
                     time.sleep(len(chunk) / self._thread_speed_limit * 0.95)

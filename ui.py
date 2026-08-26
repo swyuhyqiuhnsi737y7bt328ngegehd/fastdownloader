@@ -2,6 +2,7 @@ import os, json, time, threading, urllib.parse, socket
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
+from PyQt5.QtCore import pyqtSignal
 
 from engine import DownloadTask
 from utils import format_size, format_time
@@ -92,9 +93,13 @@ class ProgressDelegate(QStyledItemDelegate):
 
 
 class MainWindow(QMainWindow):
+    # 工作线程通过信号把事件投递到 GUI 线程，避免跨线程操作 Qt 控件
+    _task_event = pyqtSignal(int, str, object)
+
     def __init__(self):
         super().__init__()
         self.tasks = {}
+        self._task_event.connect(self._on_event_gui)
         self.next_id = 0
         self._filter = 'all'
         self._hidden = set()
@@ -466,6 +471,12 @@ class MainWindow(QMainWindow):
         self._apply_filter()
 
     def _on_task_event(self, tid, event, data=None):
+        # 由工作线程（下载线程/monitor）调用：只做线程安全的信号投递，
+        # 绝不直接操作 Qt 控件（QTimer.singleShot 在非 GUI 线程中回调永远不会执行）
+        self._task_event.emit(tid, event, data)
+
+    def _on_event_gui(self, tid, event, data=None):
+        """GUI 线程中处理任务事件（信号自动队列到主线程）"""
         if event == 'error' and not getattr(self, '_closing', False):
             task = self.tasks.get(tid)
             if task is None:
@@ -473,7 +484,7 @@ class MainWindow(QMainWindow):
             if getattr(task, '_error_notified', False):
                 return  # 同一任务只提示一次
             task._error_notified = True
-            QTimer.singleShot(0, lambda d=data: QMessageBox.critical(self, '下载错误', f'任务 {tid} 失败:\n{d}'))
+            QMessageBox.critical(self, '下载错误', f'任务 {tid} 失败:\n{data}')
 
     def _tid_of(self, item):
         return item.data(0, Qt.UserRole) if item else None
