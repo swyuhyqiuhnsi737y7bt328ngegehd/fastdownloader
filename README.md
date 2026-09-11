@@ -400,16 +400,28 @@ Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
 - 用 **zip 目录版**代替单文件版：没有自解压行为，误报率明显更低；
 - 把程序放在**非系统盘的普通目录**（别放 `C:\Windows`、`%TEMP%`、启动目录这类高危位置）。
 
-#### 顺带一提：别装多套杀软
+#### 顺带一提：确认到底是哪套杀软在拦你
 
-同时开几套实时防护（比如 360 + 腾讯电脑管家 + Defender）会让误报概率成倍上升，
-它们之间也会互相告警、互相抢文件。留一套你信任的就够了。
-可以用这条命令看看当前注册了几套：
+安全中心里"注册"了几套杀软 ≠ 几套在运行：卸载残留的条目会一直留在注册表里，
+看起来像装了三套，实际可能只有一套在工作。先分别查"注册"和"在运行"：
 
 ```powershell
+# 已注册的（含卸载残留）
 Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct |
     Select-Object displayName, productState
+
+# 真正在跑的实时防护进程（360 / 腾讯管家 / Defender 各自的特征进程）
+Get-Process | Where-Object { $_.ProcessName -match '360|QQPC|ZhuDongFangYu|MsMpEng' } |
+    Select-Object ProcessName, Id
 ```
+
+注意：只要安全中心里注册了第三方杀软，Windows 就会把 **Defender 降为被动模式**
+（`WinDefend` 服务显示 Stopped 是正常的，不是故障）。所以"加白名单"要加在
+**实际在跑的那一套**上，加错了地方等于没加。
+
+尤其留意 **360 的主动防御（ZhuDongFangYu 进程）**：它拦的是"未知程序的行为"，
+对"读取浏览器 Cookie""程序自我更新"这类动作最敏感——而这正是本程序会被拦的原因。
+在 360 的信任区里放行整个安装目录，比逐个文件放行更省事。
 
 #### 提交误报，让厂商修掉（推荐同时做）
 
