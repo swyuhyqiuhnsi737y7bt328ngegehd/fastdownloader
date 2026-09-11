@@ -18,6 +18,9 @@ DEFAULTS = {
     'proxy': '',                 # 代理：http://host:port / socks5://host:port
     'custom_headers': {},        # 附加到每个请求的请求头 {name: value}
     'verify_ssl': False,         # 是否校验服务器 TLS 证书
+    'conflict_policy': 'rename',  # 目标文件已存在：rename 改名 / overwrite 覆盖 / skip 跳过
+    'check_disk_space': True,    # 下载前检查磁盘剩余空间
+    'min_free_mb': 100,          # 磁盘保留安全余量（MB），低于该值时自动暂停
 }
 
 # 数值型字段的合法范围（越界一律回退默认值）
@@ -29,6 +32,7 @@ _RANGES = {
     'retry_backoff': (0.0, 60.0),
     'connect_timeout': (1, 600),
     'read_timeout': (1, 3600),
+    'min_free_mb': (0, 1024000),
 }
 
 
@@ -53,7 +57,7 @@ def _clean(key, value):
             except (TypeError, ValueError):
                 return default
         return num if lo <= num <= hi else default
-    if key == 'verify_ssl':
+    if key in ('verify_ssl', 'check_disk_space'):
         return bool(value)
     if key == 'save_directory':
         if not isinstance(value, str) or not value.strip():
@@ -61,6 +65,9 @@ def _clean(key, value):
         return os.path.normpath(value)
     if key == 'proxy':
         return value.strip() if isinstance(value, str) else default
+    if key == 'conflict_policy':
+        policy = str(value).lower() if isinstance(value, str) else ''
+        return policy if policy in ('rename', 'overwrite', 'skip') else default
     return value if isinstance(value, type(default)) else default
 
 

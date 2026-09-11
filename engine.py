@@ -5,9 +5,13 @@ import time
 import os
 import json
 import re
+import errno
 import random
+import shutil
 import traceback
 import urllib.parse
+
+from utils import format_size
 from collections import deque
 from browser_cookies import apply_cookies_to_session
 from playwright_handler import is_available as pw_available, resolve_cookies, apply_playwright_cookies, download_via_playwright as pw_download
@@ -30,6 +34,22 @@ HEADERS = {
 
 class RangeNotHonored(Exception):
     """服务器未按请求返回 Range 区间：重试也不会成功，直接向上报告"""
+
+
+class DiskFullError(Exception):
+    """写入时磁盘写满：重试无意义，直接报告并保留 .part 以便清理后续传"""
+
+
+def _unique_path(path, limit=9999):
+    """返回不冲突的路径：原路径可用就返回原路径，否则 name (1).ext / name (2).ext …"""
+    if not os.path.exists(path) and not os.path.exists(path + '.part'):
+        return path
+    base, ext = os.path.splitext(path)
+    for i in range(1, limit):
+        candidate = f'{base} ({i}){ext}'
+        if not os.path.exists(candidate) and not os.path.exists(candidate + '.part'):
+            return candidate
+    return f'{base} ({int(time.time())}){ext}'
 
 
 class TokenBucket:
@@ -94,7 +114,8 @@ def _req_headers(url, extra=None, custom=None):
 class DownloadTask:
     def __init__(self, task_id, url, save_path, num_threads=8, speed_limit=0, overwrite=True,
                  proxy='', headers=None, retry_count=3, retry_backoff=1.0,
-                 connect_timeout=15, read_timeout=30, verify_ssl=False):
+                 connect_timeout=15, read_timeout=30, verify_ssl=False,
+                 conflict_policy='rename', check_disk_space=True, min_free_mb=100):
         self.task_id = task_id
         self.url = url
         self.save_path = save_path
@@ -109,6 +130,14 @@ class DownloadTask:
         self.connect_timeout = max(1, int(connect_timeout))
         self.read_timeout = max(1, int(read_timeout))
         self.verify_ssl = bool(verify_ssl)
+        # 'rename' 自动改名 / 'overwrite' 覆盖 / 'skip' 跳过已存在文件
+        policy = str(conflict_policy or 'rename').lower()
+        self.conflict_policy = policy if policy in ('rename', 'overwrite', 'skip') else 'rename'
+        self.check_disk_space = bool(check_disk_space)
+        self.min_free_mb = max(0, int(min_free_mb))
+        self.space_check_interval = 10.0   # 运行中磁盘检查间隔（秒）
+        # 开始时目标文件是否已存在（覆盖策略或断点续传时，它就是我们要替换的文件）
+        self._target_owned = False
         self.total_size = 0
         self.downloaded = 0
         self.status = 'ready'
@@ -205,6 +234,57 @@ class DownloadTask:
         if cur <= hi:
             gaps.append((cur, hi))
         return gaps
+
+    # ---- 文件名冲突策略 ----
+
+    def _resolve_conflict(self):
+        """目标文件已存在时按策略处理。返回 False 表示本轮不应继续下载。"""
+        path = self.save_path
+        if not os.path.exists(path):
+            return True
+        self._target_owned = True   # 目标本来就在，完成时由我们替换
+        if os.path.exists(path + '.part'):
+            # 有未完成的 .part：这是我们自己的续传，保持原路径，
+            # 否则会把续传进度丢在一个新名字上，等于从头再下。
+            log(f'目标已存在但有 .part，按断点续传处理: {path}')
+            return True
+        if self.conflict_policy == 'overwrite':
+            log(f'目标已存在，按策略覆盖: {path}')
+            return True
+        if self.conflict_policy == 'skip':
+            log(f'目标已存在，按策略跳过: {path}')
+            self.status = 'skipped'
+            self._final_path = path
+            self._notify('skipped', path)
+            return False
+        # rename：自动换一个不冲突的名字
+        new_path = _unique_path(path)
+        log(f'目标已存在，自动重命名: {path} -> {new_path}')
+        self.save_path = new_path
+        return True
+
+    # ---- 磁盘空间 ----
+
+    def _free_space(self):
+        """目标目录所在磁盘的剩余字节；取不到返回 None"""
+        try:
+            target = os.path.dirname(self.save_path) or '.'
+            return shutil.disk_usage(target).free
+        except OSError:
+            return None
+
+    def _check_disk_space(self, need_bytes):
+        """空间够返回 None，不够返回给用户看的错误消息"""
+        if not self.check_disk_space or need_bytes <= 0:
+            return None
+        free = self._free_space()
+        if free is None:
+            return None
+        reserve = self.min_free_mb * 1024 * 1024
+        if free < need_bytes + reserve:
+            return (f'磁盘空间不足：还需要 {format_size(need_bytes)}，'
+                    f'当前可用 {format_size(free)}（保留 {self.min_free_mb} MB 安全余量）')
+        return None
 
     def _head(self, url, **kw):
         kw.setdefault('timeout', (self.connect_timeout, self.read_timeout))
@@ -339,12 +419,10 @@ class DownloadTask:
                 log(f'创建目录异常: {traceback.format_exc()}')
                 return
 
-        # 不覆盖模式下目标已存在：直接报错返回（Windows 下 os.rename 无法覆盖已存在文件）
-        if not self.overwrite and os.path.exists(self.save_path):
-            self.status = 'error'
-            self._error_msg = f'文件已存在，未覆盖: {self.save_path}'
-            self._notify('error', self._error_msg)
-            log(f'overwrite=False 且文件已存在: {self.save_path}')
+        # 文件名冲突：按策略处理（重命名 / 覆盖 / 跳过）
+        # 注意 overwrite 是旧接口参数，默认 True；它不再改写策略，
+        # 否则用户选的"自动重命名"会被默认值悄悄变成"覆盖"。
+        if not self._resolve_conflict():
             return
 
         # 旧文件在最终 rename 时才删除（finalize 内），
@@ -440,6 +518,19 @@ class DownloadTask:
                 ranges = [(existing, -1)]
                 self.num_threads = 1
 
+        # ---- 磁盘空间预检查 ----
+        # 续传时只需要补空洞的字节数，不能按整个文件大小判断，否则会误报空间不足
+        need = self.total_size - self.downloaded if self.total_size > 0 else 0
+        disk_err = self._check_disk_space(need)
+        if disk_err:
+            self.status = 'error'
+            self._error_msg = disk_err
+            self._notify('error', disk_err)
+            log(f'磁盘空间不足，拒绝开始下载: {disk_err}')
+            return
+        if need > 0:
+            log(f'磁盘检查通过: 需要 {format_size(need)}, 可用 {format_size(self._free_space() or 0)}')
+
         try:
             if not os.path.exists(temp):
                 open(temp, 'wb').close()
@@ -481,8 +572,8 @@ class DownloadTask:
     def _should_retry(self, exc):
         if self.retry_count <= 0:
             return False
-        if isinstance(exc, RangeNotHonored):
-            return False  # 服务器不支持 Range / 区间错位：重试只会再次失败
+        if isinstance(exc, (RangeNotHonored, DiskFullError)):
+            return False  # 区间问题/磁盘写满：重试只会再次失败
         if isinstance(exc, curl_requests.exceptions.HTTPError):
             code = 0
             resp = getattr(exc, 'response', None)
@@ -553,9 +644,15 @@ class DownloadTask:
                 if self.status != 'running' or gen != self._generation:
                     stat['status'] = 'stopped'
                     break
-                self.file.seek(cur)
-                self.file.write(chunk)
-                self.file.flush()
+                try:
+                    self.file.seek(cur)
+                    self.file.write(chunk)
+                    self.file.flush()
+                except OSError as e:
+                    if getattr(e, 'errno', None) == errno.ENOSPC or 'space' in str(e).lower():
+                        raise DiskFullError(
+                            '磁盘空间已满，下载已停止；清理磁盘后点"继续"可断点续传')
+                    raise
                 self.downloaded += len(chunk)
                 self._bytes_since_update += len(chunk)
                 stat['downloaded'] += len(chunk)
@@ -648,6 +745,7 @@ class DownloadTask:
     def _monitor(self, gen, q):
         done = 0
         last_meta_save = time.time()
+        last_space_check = time.time()
         while self.status == 'running' and gen == self._generation:
             try:
                 msg = q.get(timeout=1.0)
@@ -664,8 +762,20 @@ class DownloadTask:
                         self._save_spans()
                         self._notify('error', self._error_msg)
                     return
-                # 周期性落盘断点区间（崩溃后可续传）
                 now = time.time()
+                # 磁盘保护：剩余空间低于安全线时自动暂停，避免写满系统盘
+                if self.min_free_mb > 0 and now - last_space_check > self.space_check_interval:
+                    last_space_check = now
+                    free = self._free_space()
+                    if free is not None and free < self.min_free_mb * 1024 * 1024:
+                        msg = (f'磁盘剩余空间不足 {self.min_free_mb} MB'
+                               f'（当前 {format_size(free)}），已自动暂停任务，清理后可继续')
+                        log(msg)
+                        self._error_msg = msg
+                        self._notify('warning', msg)
+                        self.pause()
+                        return
+                # 周期性落盘断点区间（崩溃后可续传）
                 if now - last_meta_save > 2:
                     with self.lock:
                         self._spans = self._collect_spans()
@@ -721,10 +831,18 @@ class DownloadTask:
                         raise RuntimeError(
                             f'文件不完整：期望{self.total_size}字节，实际{actual}字节')
 
-                # 覆盖模式下，重命名前才删除旧文件（避免下载失败丢旧文件）
-                if self.overwrite and os.path.exists(self.save_path):
-                    log(f'finalize: 删除旧文件 {self.save_path}')
-                    os.remove(self.save_path)
+                # 目标已存在时：属于我们自己的（覆盖策略 / 断点续传）就替换它，
+                # 是下载期间被别人新建的则另存，别把别人的文件删了。
+                if os.path.exists(self.save_path):
+                    if self.conflict_policy == 'overwrite' or self._target_owned:
+                        log(f'finalize: 删除旧文件 {self.save_path}')
+                        if os.path.isdir(self.save_path):
+                            raise RuntimeError(f'目标路径是目录，无法写入: {self.save_path}')
+                        os.remove(self.save_path)
+                    else:
+                        new_path = _unique_path(self.save_path)
+                        log(f'finalize: 目标被占用，改存 {new_path}')
+                        self.save_path = new_path
 
                 # 重命名为最终文件
                 os.rename(temp, self.save_path)

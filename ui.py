@@ -15,13 +15,13 @@ STATUS_LABELS = {
     'running':   '正在下载', 'completed': '已完成',
     'error':     '失败',     'paused':    '已暂停',
     'stopped':   '已停止',   'ready':     '等待中',
-    'queued':    '排队中',
+    'queued':    '排队中', 'skipped':   '已存在',
 }
 STATUS_COLORS = {
     'running':   '#5dade2', 'completed': '#58d68d',
     'error':     '#ec7063', 'paused':    '#f5b041',
     'stopped':   '#bdc3c7', 'ready':     '#aeb6bf',
-    'queued':    '#8e9aaf',
+    'queued':    '#8e9aaf', 'skipped':   '#7fb3d5',
 }
 
 CATEGORY_RULES = [
@@ -434,7 +434,7 @@ class MainWindow(QMainWindow):
         if f == 'unfinished':
             return task.status in ('ready', 'running', 'paused', 'stopped', 'error', 'queued')
         if f == 'completed':
-            return task.status == 'completed'
+            return task.status in ('completed', 'skipped')
         exts = CATEGORY_EXTS.get(f, [])
         if not exts:
             return True
@@ -550,6 +550,9 @@ class MainWindow(QMainWindow):
             connect_timeout=s.connect_timeout,
             read_timeout=s.read_timeout,
             verify_ssl=s.verify_ssl,
+            conflict_policy=s.conflict_policy,
+            check_disk_space=s.check_disk_space,
+            min_free_mb=s.min_free_mb,
         )
 
     def _add_task(self, url, save_path, priority=0, start_now=True):
@@ -666,7 +669,15 @@ class MainWindow(QMainWindow):
 
     def _on_event_gui(self, tid, event, data=None):
         """GUI 线程中处理任务事件（信号自动队列到主线程）"""
-        if event == 'error' and not getattr(self, '_closing', False):
+        if getattr(self, '_closing', False):
+            return
+        if event == 'skipped':
+            QMessageBox.information(self, '已跳过', f'任务 {tid} 的目标文件已存在，按设置跳过下载:\n{data}')
+            return
+        if event == 'warning':
+            QMessageBox.warning(self, '提示', str(data))
+            return
+        if event == 'error':
             task = self.tasks.get(tid)
             if task is None:
                 return  # 任务已被删除，不再弹窗
@@ -1296,7 +1307,23 @@ class MainWindow(QMainWindow):
         speed_spin = QSpinBox(); speed_spin.setRange(0, 999999); speed_spin.setSuffix(' KB/s')
         speed_spin.setValue(self.settings.speed_limit)
         f1.addRow('全局限速（0=不限）', speed_spin)
-        hint1 = QLabel('线程数作用于单个任务；同时下载任务数决定队列并发上限，\n超出部分自动排队（可用右键菜单调整优先级）。')
+        policy_combo = QComboBox()
+        policy_combo.addItem('自动重命名 name (1).ext', 'rename')
+        policy_combo.addItem('覆盖已有文件', 'overwrite')
+        policy_combo.addItem('跳过已有文件', 'skip')
+        _pidx = policy_combo.findData(self.settings.conflict_policy)
+        policy_combo.setCurrentIndex(_pidx if _pidx >= 0 else 0)
+        f1.addRow('目标文件已存在', policy_combo)
+        disk_chk = QCheckBox('下载前检查磁盘剩余空间')
+        disk_chk.setChecked(bool(self.settings.check_disk_space))
+        f1.addRow(disk_chk)
+        free_spin = QSpinBox(); free_spin.setRange(0, 1024000); free_spin.setSuffix(' MB')
+        free_spin.setValue(self.settings.min_free_mb)
+        f1.addRow('磁盘保留余量', free_spin)
+        hint1 = QLabel('线程数作用于单个任务；同时下载任务数决定队列并发上限，\n'
+                       '超出部分自动排队（可用右键菜单调整优先级）。\n'
+                       '磁盘保留余量：剩余空间低于该值时自动暂停下载，避免写满系统盘\n'
+                       '（断点续传的 .part 会自动保留，清理磁盘后点"继续"即可）。')
         hint1.setStyleSheet('color: #b8c4d0;')
         f1.addRow(hint1)
         tabs.addTab(page1, '常规')
@@ -1363,6 +1390,9 @@ class MainWindow(QMainWindow):
             self.settings.retry_count = retry_spin.value()
             self.settings.retry_backoff = backoff_spin.value()
             self.settings.custom_headers = self._parse_headers(headers_edit.toPlainText())
+            self.settings.conflict_policy = policy_combo.currentData()
+            self.settings.check_disk_space = disk_chk.isChecked()
+            self.settings.min_free_mb = free_spin.value()
             self.settings.save()
             self._apply_speed_to_tasks()   # 限速对运行中任务立即生效
             self._schedule()               # 并发上限调大时立即启动排队任务

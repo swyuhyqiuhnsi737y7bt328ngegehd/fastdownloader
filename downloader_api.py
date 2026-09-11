@@ -94,7 +94,10 @@ def dl_create_task(url, save_path, num_threads=8, speed_limit_kb=0):
     with _lock:
         tid = _next_id
         _next_id += 1
-        task = DownloadTask(tid, url, save_path, num_threads, speed_limit_kb, overwrite=True)
+        # C API 调用方明确指定了路径，期望文件就落在这里，因此用覆盖策略；
+        # GUI 默认用 'rename' 避免不小心覆盖用户已有文件。
+        task = DownloadTask(tid, url, save_path, num_threads, speed_limit_kb,
+                            overwrite=True, conflict_policy='overwrite')
         task.set_callback(_on_task_event)
         _tasks[tid] = task
     return tid
