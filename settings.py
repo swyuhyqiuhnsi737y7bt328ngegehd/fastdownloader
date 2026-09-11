@@ -21,6 +21,7 @@ DEFAULTS = {
     'conflict_policy': 'rename',  # 目标文件已存在：rename 改名 / overwrite 覆盖 / skip 跳过
     'check_disk_space': True,    # 下载前检查磁盘剩余空间
     'min_free_mb': 100,          # 磁盘保留安全余量（MB），低于该值时自动暂停
+    'check_update_on_start': True,  # 启动时检查 GitHub Releases 是否有新版本
 }
 
 # 数值型字段的合法范围（越界一律回退默认值）
@@ -57,7 +58,7 @@ def _clean(key, value):
             except (TypeError, ValueError):
                 return default
         return num if lo <= num <= hi else default
-    if key in ('verify_ssl', 'check_disk_space'):
+    if key in ('verify_ssl', 'check_disk_space', 'check_update_on_start'):
         return bool(value)
     if key == 'save_directory':
         if not isinstance(value, str) or not value.strip():

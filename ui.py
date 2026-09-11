@@ -10,6 +10,8 @@ from settings import Settings
 from clipboard_watcher import ClipboardWatcher
 from remote_browser import RemoteServer, load_servers, save_servers
 from task_store import save_tasks, load_tasks, restored_status
+import updater
+from version import __version__
 
 STATUS_LABELS = {
     'running':   '正在下载', 'completed': '已完成',
@@ -98,11 +100,21 @@ class ProgressDelegate(QStyledItemDelegate):
 class MainWindow(QMainWindow):
     # 工作线程通过信号把事件投递到 GUI 线程，避免跨线程操作 Qt 控件
     _task_event = pyqtSignal(int, str, object)
+    _update_result = pyqtSignal(object, bool, bool)   # release, has_update, silent
+    _update_error = pyqtSignal(str, bool)             # message, silent
+    _update_progress = pyqtSignal(int, int)           # downloaded, total
+    _update_done = pyqtSignal()                        # 替换脚本已就绪
 
     def __init__(self):
         super().__init__()
         self.tasks = {}
         self._task_event.connect(self._on_event_gui)
+        self._update_result.connect(self._on_update_result)
+        self._update_error.connect(self._on_update_error)
+        self._update_progress.connect(self._on_update_progress)
+        self._update_done.connect(self._on_update_done)
+        self._update_checking = False
+        self._update_dlg = None
         self._closing = False
         self._last_persist = 0.0
         self.next_id = 0
@@ -118,6 +130,9 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._update_ui)
         self._timer.start(500)
         self.clip_watcher = ClipboardWatcher(self, self.on_clipboard_url)
+        if getattr(self.settings, 'check_update_on_start', True):
+            # 延迟几秒，别和启动时的界面绘制抢时间
+            QTimer.singleShot(4000, lambda: self.check_updates(silent=True))
         try:
             n = self._restore_tasks()
             if n:
@@ -416,8 +431,11 @@ class MainWindow(QMainWindow):
 
         vm = bar.addMenu('查看')
         vm.addAction('搜索任务', self.focus_search, QKeySequence.Find)
-        vm.addSeparator()
-        vm.addAction('关于', self.show_about)
+        hm = bar.addMenu('帮助')
+        hm.addAction('检查更新', lambda: self.check_updates(silent=False))
+        hm.addAction('打开发布页面', self.open_releases_page)
+        hm.addSeparator()
+        hm.addAction('关于', self.show_about)
 
     # ---- Category ----
 
@@ -1317,6 +1335,9 @@ class MainWindow(QMainWindow):
         disk_chk = QCheckBox('下载前检查磁盘剩余空间')
         disk_chk.setChecked(bool(self.settings.check_disk_space))
         f1.addRow(disk_chk)
+        update_chk = QCheckBox('启动时检查更新（GitHub Releases）')
+        update_chk.setChecked(bool(getattr(self.settings, 'check_update_on_start', True)))
+        f1.addRow(update_chk)
         free_spin = QSpinBox(); free_spin.setRange(0, 1024000); free_spin.setSuffix(' MB')
         free_spin.setValue(self.settings.min_free_mb)
         f1.addRow('磁盘保留余量', free_spin)
@@ -1393,6 +1414,7 @@ class MainWindow(QMainWindow):
             self.settings.conflict_policy = policy_combo.currentData()
             self.settings.check_disk_space = disk_chk.isChecked()
             self.settings.min_free_mb = free_spin.value()
+            self.settings.check_update_on_start = update_chk.isChecked()
             self.settings.save()
             self._apply_speed_to_tasks()   # 限速对运行中任务立即生效
             self._schedule()               # 并发上限调大时立即启动排队任务
@@ -1402,9 +1424,161 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
         dlg.exec_()
+    # ---- 更新对话框 ----
+
+    _KIND_LABELS = {'onefile': '单文件版', 'standalone': '目录版', 'source': '源码运行'}
+
+    def _show_update_dialog(self, release):
+        if getattr(self, '_update_dlg', None) is not None:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle('发现新版本')
+        dlg.resize(580, 470)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 18, 18, 18)
+
+        head = QLabel(f'<b style="font-size:13pt">新版本 {release.get("tag", "")}</b>')
+        layout.addWidget(head)
+        layout.addWidget(QLabel(f'当前版本：v{__version__}'))
+
+        notes = QPlainTextEdit(release.get('notes') or '（本次发布没有填写说明）')
+        notes.setReadOnly(True)
+        layout.addWidget(notes, 1)
+
+        kind = updater.detect_install_kind()
+        asset_name, _info = updater.pick_asset(release, kind)
+        kind_text = self._KIND_LABELS.get(kind, kind)
+        info_text = f'安装方式：{kind_text}'
+        if asset_name:
+            info_text += f'　将下载：{asset_name}'
+        else:
+            info_text += '　（该发布没有适用于当前安装方式的文件）'
+        layout.addWidget(QLabel(info_text))
+
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(True)
+        layout.addWidget(bar)
+        self._update_bar = bar
+
+        btn_row = QHBoxLayout()
+        page_btn = QPushButton('打开发布页面')
+        page_btn.clicked.connect(self.open_releases_page)
+        btn_row.addWidget(page_btn)
+        btn_row.addStretch()
+        later_btn = QPushButton('稍后')
+        later_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(later_btn)
+        install_btn = QPushButton('下载并安装')
+        install_btn.setStyleSheet('QPushButton { background: #2ecc71; color: white; padding: 6px 18px; border-radius: 3px; }')
+        install_btn.clicked.connect(lambda: self._start_self_update(dlg, release))
+        btn_row.addWidget(install_btn)
+        if not asset_name:
+            install_btn.setEnabled(False)
+        layout.addLayout(btn_row)
+
+        self._update_dlg = dlg
+        try:
+            dlg.exec_()
+        finally:
+            self._update_dlg = None
+            self._update_bar = None
+
+    def _start_self_update(self, dlg, release):
+        kind = updater.detect_install_kind()
+        ok, reason = updater.can_self_update(kind)
+        if not ok:
+            QMessageBox.warning(self, '无法自动更新', f'{reason}\n\n可手动从发布页面下载。')
+            self.open_releases_page()
+            return
+        target = updater.install_root(kind)
+        if QMessageBox.question(
+                self, '确认更新',
+                f'将下载新版本，并在程序退出后替换：\n{target}\n随后自动重新启动。\n\n继续吗？',
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        bar = getattr(self, '_update_bar', None)
+        if bar is not None:
+            bar.setRange(0, 0)      # 未知总量：忙碌指示
+
+        def worker():
+            try:
+                updater.self_update(release, kind,
+                                    progress=lambda d, t: self._update_progress.emit(d, t))
+            except Exception as e:
+                self._update_error.emit(f'更新失败：{e}', False)
+                return
+            self._update_done.emit()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_progress(self, done, total):
+        bar = getattr(self, '_update_bar', None)
+        if bar is None:
+            return
+        if total > 0:
+            bar.setRange(0, 100)
+            bar.setValue(int(done * 100 / total))
+            bar.setFormat(f'%p%  ({format_size(done)} / {format_size(total)})')
+        else:
+            bar.setRange(0, 0)
+
+    def _on_update_done(self):
+        self._closing = True
+        dlg = getattr(self, '_update_dlg', None)
+        if dlg is not None:
+            dlg.accept()
+        QMessageBox.information(
+            self, '更新已就绪',
+            '新版本已下载完成。\n\n程序将立即退出，随后自动替换文件并重新启动。')
+        self.close()      # 走 closeEvent：保存设置/任务列表并停止下载
+
+    def open_releases_page(self):
+        QDesktopServices.openUrl(QUrl(updater.RELEASES_PAGE))
+
+    def check_updates(self, silent=False):
+        """检查更新；silent=True 表示后台静默检查（无更新时不打扰用户）"""
+        if getattr(self, '_update_checking', False):
+            return
+        self._update_checking = True
+        if not silent:
+            self.status_label.setText('正在检查更新...')
+
+        def worker():
+            try:
+                release, has_update = updater.check_for_update()
+                self._update_result.emit(release, has_update, silent)
+            except Exception as e:
+                self._update_error.emit(str(e), silent)
+            finally:
+                self._update_checking = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_error(self, message, silent):
+        if not silent and not getattr(self, '_closing', False):
+            QMessageBox.warning(self, '检查更新失败',
+                                f'无法获取版本信息：\n{message}\n\n可手动访问发布页面查看。')
+        self.status_label.setText('检查更新失败')
+
+    def _on_update_result(self, release, has_update, silent):
+        if getattr(self, '_closing', False):
+            return
+        if release is None:
+            return
+        if not has_update:
+            if not silent:
+                QMessageBox.information(self, '检查更新',
+                                        f'当前已是最新版本 v{__version__}')
+            self.status_label.setText(f'已是最新版本 v{__version__}')
+            return
+        self.status_label.setText(f'发现新版本 {release["tag"]}')
+        self._show_update_dialog(release)
+
     def show_about(self):
-        text = ("⚡ 极速下载器 Pro - Fast Downloader Pro\n\n"
-                "\n\n"
+        text = ("⚡ 极速下载器 Pro - Fast Downloader Pro  v" + __version__ + "\n\n"
                 "▸ 多线程并发下载\n▸ 浏览器 Cookie 导入\n"
                 "▸ Playwright 浏览器降级\n▸ curl_cffi TLS 指纹模拟\n"
                 "▸ 断点续传 / 暂停 / 恢复\n▸ 批量下载 / 导出导入")

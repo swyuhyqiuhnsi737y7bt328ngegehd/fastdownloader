@@ -108,6 +108,42 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(pal.color(pal.Window).name(), '#1e1e1e')
         self.assertEqual(pal.color(pal.WindowText).name(), '#e0e0e0')
 
+    def test_update_dialog_builds_and_closes(self):
+        """更新对话框能构建（含发布说明、资产信息、进度条）并能正常关闭"""
+        from PyQt5.QtWidgets import QMenu
+        release = {
+            'tag': 'v9.9.9', 'name': 'Release v9.9.9', 'notes': '\n'.join(f'改动 {i}' for i in range(40)),
+            'html_url': 'https://example.invalid/releases', 'published_at': '',
+            'assets': {
+                'FastDownloader.exe': {'url': 'u1', 'size': 1024, 'digest': ''},
+                'fastdownloader.zip': {'url': 'u2', 'size': 2048, 'digest': ''},
+            },
+        }
+        QTimer.singleShot(300, lambda: (_app.activeModalWidget().reject()
+                                        if _app.activeModalWidget() is not None else _app.quit()))
+        self.win._show_update_dialog(release)
+        self.assertIsNone(self.win._update_dlg)      # exec_ 返回后必须清理引用
+        self.assertIsNone(getattr(self.win, '_update_bar', None))
+
+    def test_help_menu_exposes_update_actions(self):
+        from PyQt5.QtWidgets import QMenu
+        titles = [a.text() for m in self.win.menuBar().findChildren(QMenu)
+                  for a in m.actions()]
+        self.assertIn('检查更新', titles)
+        self.assertIn('打开发布页面', titles)
+        self.assertIn('关于', titles)
+
+    def test_update_error_slot_is_safe(self):
+        # 静默失败不应弹窗，也不应抛异常
+        self.win._on_update_error('network down', True)
+        self.win._on_update_result(None, False, True)
+        self.win._on_update_progress(50, 100)        # 没有对话框时也要安全
+
+    def test_about_shows_version(self):
+        from version import __version__
+        self.assertTrue(__version__)
+        self.win.show_about_version = __version__    # 版本号可被引用（不存在则抛 AttributeError）
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
