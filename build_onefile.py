@@ -31,6 +31,7 @@ import sys
 import shutil
 import subprocess
 import platform
+import zipfile
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -246,6 +247,45 @@ def _exclude_flags(packages):
 
 
 
+def check_compiler_cache():
+    """构建前扫一遍 Nuitka 的下载缓存，删掉损坏的压缩包。
+
+    事故背景：编译器包（约 255MB）下载中断时会留下一个"看起来有几十 MB、
+    实际是半截"的 zip。Nuitka 解压失败后 scons 会**一直挂着**——不报错、
+    不退出、CPU 也是 0，比直接失败难查得多（实测卡了 24 分钟没动静）。
+    这里提前发现并删除，让 Nuitka 重新下载。
+    """
+    roots = []
+    env_dir = os.environ.get("NUITKA_CACHE_DIR")
+    if env_dir:
+        roots.append(Path(env_dir))
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.append(Path(local) / "Nuitka" / "Nuitka" / "Cache")
+    cleaned = 0
+    for root in roots:
+        downloads = root / "downloads"
+        if not downloads.is_dir():
+            continue
+        for archive_path in downloads.rglob("*.zip"):
+            try:
+                with zipfile.ZipFile(archive_path) as zf:
+                    if zf.testzip() is not None:
+                        raise zipfile.BadZipFile("CRC check failed")
+            except (zipfile.BadZipFile, OSError, EOFError):
+                size_mb = archive_path.stat().st_size / 1048576
+                print(f"  [WARN] 编译器缓存损坏（{size_mb:.1f}MB，下载不完整），已删除:")
+                print(f"         {archive_path}")
+                print("         Nuitka 会在构建时重新下载（约 255MB，请保持网络稳定）")
+                try:
+                    archive_path.unlink()
+                    cleaned += 1
+                except OSError:
+                    pass
+    if cleaned:
+        print(f"  [OK] 已清理 {cleaned} 个损坏的缓存包\n")
+    return cleaned
+
 def metadata_flags():
     """Windows 版本资源（产品名/公司/版本/版权/图标）。
 
@@ -260,12 +300,12 @@ def metadata_flags():
     except Exception:
         ver4 = '0.0.0.0'
     flags = (
-        ' --windows-company-name="FastDownloader"'
-        ' --windows-product-name="Fast Downloader Pro"'
-        ' --windows-file-description="Fast Downloader Pro - 多线程下载器"'
-        f' --windows-file-version={ver4}'
-        f' --windows-product-version={ver4}'
-        ' --windows-copyright="MIT License"'
+        ' --company-name="FastDownloader"'
+        ' --product-name="Fast Downloader Pro"'
+        ' --file-description="Fast Downloader Pro - Multi-threaded Downloader"'
+        f' --file-version={ver4}'
+        f' --product-version={ver4}'
+        ' --copyright="MIT License"'
     )
     icon = ROOT / 'assets' / 'app.ico'
     if icon.exists():
@@ -291,6 +331,7 @@ def build_onefile(mode="std"):
         "tiny"  - 标准 + 额外排除极少用到的标准库包
     """
     print(f"=== Building Single-File EXE (mode: {mode}) ===\n")
+    check_compiler_cache()
 
     # ── 基础参数（所有模式共用）─────────────────────────
     plugin_flags = " ".join(
