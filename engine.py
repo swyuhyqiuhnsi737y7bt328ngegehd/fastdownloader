@@ -5,7 +5,9 @@ import time
 import os
 import json
 import re
+import random
 import traceback
+import urllib.parse
 from collections import deque
 from browser_cookies import apply_cookies_to_session
 from playwright_handler import is_available as pw_available, resolve_cookies, apply_playwright_cookies, download_via_playwright as pw_download
@@ -26,21 +28,87 @@ HEADERS = {
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
 }
 
-def _req_headers(url, extra=None):
+class RangeNotHonored(Exception):
+    """服务器未按请求返回 Range 区间：重试也不会成功，直接向上报告"""
+
+
+class TokenBucket:
+    """令牌桶限速器（任务内所有线程共享）。
+
+    相比按块 sleep，令牌桶允许小突发但长期速率精确，且支持运行中改速率。
+    rate <= 0 表示不限速。"""
+
+    def __init__(self, rate_bps=0, burst=None):
+        self.rate = float(rate_bps or 0)
+        self.capacity = float(burst if burst else max(self.rate, 65536))
+        self._tokens = self.capacity
+        self._last = time.time()
+        self._lock = threading.Lock()
+
+    def set_rate(self, rate_bps):
+        with self._lock:
+            self.rate = float(rate_bps or 0)
+            self.capacity = max(self.rate, 65536)
+            self._tokens = min(self._tokens, self.capacity)
+
+    def consume(self, amount, stop_check=None):
+        """取走 amount 个令牌，不足则等待；stop_check() 为假时提前返回 False"""
+        if self.rate <= 0:
+            return True
+        while True:
+            with self._lock:
+                now = time.time()
+                self._tokens = min(self.capacity, self._tokens + (now - self._last) * self.rate)
+                self._last = now
+                if self._tokens >= amount:
+                    self._tokens -= amount
+                    return True
+                need = (amount - self._tokens) / self.rate
+            if stop_check is not None and not stop_check():
+                return False
+            time.sleep(min(need, 0.2))
+
+
+def _is_loopback(url):
+    """判断是否指向本机（127.0.0.0/8 / localhost / ::1）"""
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ''
+    except ValueError:
+        return False
+    host = host.lower().strip('[]')
+    if host in ('localhost', '::1', '0.0.0.0'):
+        return True
+    return host.startswith('127.')
+
+
+def _req_headers(url, extra=None, custom=None):
     origin = '/'.join(url.split('/')[:3]) + '/'
     h = {**HEADERS, 'Referer': origin}
+    if custom:
+        # 自定义请求头优先级最高，允许覆盖 Referer/User-Agent 等默认值
+        h.update({str(k): str(v) for k, v in custom.items() if k})
     if extra:
         h.update(extra)
     return h
 
 class DownloadTask:
-    def __init__(self, task_id, url, save_path, num_threads=8, speed_limit=0, overwrite=True):
+    def __init__(self, task_id, url, save_path, num_threads=8, speed_limit=0, overwrite=True,
+                 proxy='', headers=None, retry_count=3, retry_backoff=1.0,
+                 connect_timeout=15, read_timeout=30, verify_ssl=False):
         self.task_id = task_id
         self.url = url
         self.save_path = save_path
         self.num_threads = max(1, int(num_threads))  # 防止 0/负数导致 ZeroDivisionError
         self.speed_limit = speed_limit * 1024
         self.overwrite = overwrite
+        # ---- 网络配置 ----
+        self.proxy = (proxy or '').strip()
+        self.custom_headers = {str(k): str(v) for k, v in (headers or {}).items() if k}
+        self.retry_count = max(0, int(retry_count))      # 每个分片的最大重试次数
+        self.retry_backoff = max(0.0, float(retry_backoff))
+        self.connect_timeout = max(1, int(connect_timeout))
+        self.read_timeout = max(1, int(read_timeout))
+        self.verify_ssl = bool(verify_ssl)
         self.total_size = 0
         self.downloaded = 0
         self.status = 'ready'
@@ -63,7 +131,12 @@ class DownloadTask:
         self._generation = 0  # 每轮 start/pause/stop 递增，用于作废旧线程
         self._spans = []      # 已写入的完整区间 [[a,b],...]，用于安全断点续传
         self._session = curl_requests.Session()
-        self._session.headers.update(_req_headers(url))
+        self._session.headers.update(_req_headers(url, custom=self.custom_headers))
+        if self.proxy:
+            # curl_cffi/libcurl 支持 http:// https:// socks4:// socks5:// socks5h://
+            self._session.proxies = {'http': self.proxy, 'https': self.proxy}
+        # 令牌桶：run 期间由 set_speed_limit() 动态调整
+        self._limiter = TokenBucket(self.speed_limit)
 
     # ---- 断点区间元数据（.part.meta）----
     # 多线程下载中途 .part 的“前缀”并不连续（各线程只写了各自区间的开头），
@@ -134,10 +207,17 @@ class DownloadTask:
         return gaps
 
     def _head(self, url, **kw):
-        return self._session.head(url, impersonate='chrome120', verify=False, **kw)
+        kw.setdefault('timeout', (self.connect_timeout, self.read_timeout))
+        return self._session.head(url, impersonate='chrome120', verify=self.verify_ssl, **kw)
 
     def _get(self, url, **kw):
-        return self._session.get(url, impersonate='chrome120', verify=False, **kw)
+        kw.setdefault('timeout', (self.connect_timeout, self.read_timeout))
+        return self._session.get(url, impersonate='chrome120', verify=self.verify_ssl, **kw)
+
+    def set_speed_limit(self, kb_per_sec):
+        """运行中修改限速（KB/s，0=不限），立即生效"""
+        self.speed_limit = max(0, int(kb_per_sec or 0)) * 1024
+        self._limiter.set_rate(self.speed_limit)
 
     def set_callback(self, func):
         self._callback = func
@@ -225,13 +305,16 @@ class DownloadTask:
             self._final_path = None
             self._error_msg = ''
 
-        # 自动导入浏览器 cookie
-        try:
-            n = apply_cookies_to_session(self._session, self.url)
-            if n > 0:
-                log(f'成功导入 {n} 个 cookie')
-        except Exception as e:
-            log(f'cookie 导入失败: {e}')
+        # 自动导入浏览器 cookie（回环地址不需要，跳过可省去数秒的浏览器数据库扫描）
+        if _is_loopback(self.url):
+            log('本机地址，跳过浏览器 cookie')
+        else:
+            try:
+                n = apply_cookies_to_session(self._session, self.url)
+                if n > 0:
+                    log(f'成功导入 {n} 个 cookie')
+            except Exception as e:
+                log(f'cookie 导入失败: {e}')
 
         # 如果保存路径是目录，自动生成文件名
         if os.path.isdir(self.save_path) or self.save_path.endswith(('\\', '/')):
@@ -373,8 +456,8 @@ class DownloadTask:
             log(f'打开临时文件异常: {traceback.format_exc()}')
             return
 
-        # 全局限速分摊到每个线程：总速度 ≈ speed_limit，而不是 limit × 线程数
-        self._thread_speed_limit = self.speed_limit / self.num_threads if self.num_threads else 0
+        # 全局限速由任务级令牌桶统一分配（总速率 ≈ speed_limit，与线程数无关）
+        self._limiter.set_rate(self.speed_limit)
 
         # 新的一轮下载：作废旧上一轮可能还存活的线程；
         # 每轮用独立的队列，避免旧 monitor 复活后与新 monitor 抢消息
@@ -391,82 +474,166 @@ class DownloadTask:
 
         threading.Thread(target=self._monitor, args=(gen, q), daemon=True).start()
 
+    # ---- 重试策略 ----
+    # 4xx 多为不可恢复（认证/权限/不存在），5xx 与网络抖动才值得退避重试
+    _RETRYABLE_HTTP = (408, 425, 429, 500, 502, 503, 504, 507, 509)
+
+    def _should_retry(self, exc):
+        if self.retry_count <= 0:
+            return False
+        if isinstance(exc, RangeNotHonored):
+            return False  # 服务器不支持 Range / 区间错位：重试只会再次失败
+        if isinstance(exc, curl_requests.exceptions.HTTPError):
+            code = 0
+            resp = getattr(exc, 'response', None)
+            if resp is not None:
+                code = getattr(resp, 'status_code', 0) or 0
+            if not code:
+                m = re.search(r'HTTP Error (\d{3})', str(exc))
+                code = int(m.group(1)) if m else 0
+            return code in self._RETRYABLE_HTTP
+        # 传输层故障（连接重置/超时/响应体截断/解码失败）一律可重试
+        return True
+    def _retry_delay(self, attempt):
+        """指数退避 + 抖动，上限 30 秒"""
+        base = self.retry_backoff * (2 ** attempt)
+        return min(base, 30.0) * (0.5 + random.random())
+
+    def _sleep_interruptible(self, seconds, gen):
+        """可被暂停/停止打断的等待；返回 False 表示本轮已作废"""
+        deadline = time.time() + seconds
+        while True:
+            if self.status != 'running' or gen != self._generation:
+                return False
+            remain = deadline - time.time()
+            if remain <= 0:
+                return True
+            time.sleep(min(0.2, remain))
+
+    def _check_range_response(self, resp, headers, expected_start, idx):
+        """校验服务器确实按请求返回了区间（否则写入会错位损坏文件）"""
+        if 'Range' not in headers:
+            return
+        if resp.status_code == 200:
+            if expected_start == 0:
+                # 从 0 开始写全量响应是安全的（数据没有错位），继续即可
+                return
+            raise RangeNotHonored('服务器不支持 Range 请求，为避免文件损坏已中止下载')
+        if resp.status_code == 206:
+            cr = resp.headers.get('Content-Range', '')
+            m = re.match(r'bytes\s+(\d+)-', cr or '')
+            if m and int(m.group(1)) != expected_start:
+                raise RangeNotHonored(
+                    f'服务器返回的区间与请求不符（期望从 {expected_start} 开始，实际从 {m.group(1)} 开始），'
+                    f'为避免文件损坏已中止下载')
+            if not m:
+                log(f'线程{idx} 206 但 Content-Range 无法解析: {cr!r}')
+
+    def _pump(self, idx, resp, pos, end, stat, gen):
+        """把响应体写入文件；pos 为 [当前位置] 可变容器（异常中断时也能保留进度）"""
+        for chunk in resp.iter_content():
+            cur = pos[0]
+            if self.status != 'running' or gen != self._generation:
+                stat['status'] = 'stopped'
+                log(f'线程{idx} 停止: status={self.status}, gen={gen}')
+                break
+            if end >= 0 and cur > end:
+                # 服务器返回的数据超出请求区间：停止写入，防止覆盖相邻线程的数据
+                log(f'线程{idx} 数据超出区间 end={end}, 停止')
+                break
+            if not chunk:
+                continue
+            # 令牌桶限速（任务内所有线程共享配额）
+            if self.speed_limit > 0:
+                if not self._limiter.consume(len(chunk),
+                                             stop_check=lambda: self.status == 'running' and gen == self._generation):
+                    stat['status'] = 'stopped'
+                    break
+            with self.lock:
+                if self.status != 'running' or gen != self._generation:
+                    stat['status'] = 'stopped'
+                    break
+                self.file.seek(cur)
+                self.file.write(chunk)
+                self.file.flush()
+                self.downloaded += len(chunk)
+                self._bytes_since_update += len(chunk)
+                stat['downloaded'] += len(chunk)
+                stat['bytes_since'] += len(chunk)
+                if stat['span_start'] is None:
+                    stat['span_start'] = cur
+                stat['span_end'] = cur + len(chunk) - 1
+                cur += len(chunk)
+                pos[0] = cur
+            now = time.time()
+            if now - self._last_speed_update > 0.5:
+                inst_speed = self._bytes_since_update / (now - self._last_speed_update)
+                self._speed_window.append(inst_speed)
+                if self._speed_window:
+                    self.speed = sum(self._speed_window) / len(self._speed_window)
+                self._bytes_since_update = 0
+                self._last_speed_update = now
+            if now - stat['last_update'] > 0.5:
+                ds = stat['bytes_since']
+                dt = now - stat['last_update']
+                stat['speed'] = ds / dt if dt > 0 else 0
+                stat['bytes_since'] = 0
+                stat['last_update'] = now
+        pos[0] = cur
+        return cur
+
     def _download_part(self, idx, start, end, gen, q):
         stat = {
             'status': 'running', 'start': start, 'end': end,
             'downloaded': 0, 'speed': 0.0, 'error': '',
             'last_update': time.time(), 'bytes_since': 0,
-            'span_start': None, 'span_end': None,
+            'span_start': None, 'span_end': None, 'retries': 0,
         }
         self._thread_stats[idx] = stat
+        pos = [start]   # 可变当前位置：重试时从上次真正写到的偏移继续
+        attempt = 0
         try:
-            headers = {}
-            if end >= 0:
-                headers['Range'] = f'bytes={start}-{end}'
-            elif start > 0:
-                # 未知大小续传：从 start 开始；从头下载则不带 Range（空文件服务器会回 416）
-                headers['Range'] = f'bytes={start}-'
-            log(f'线程{idx} 开始: bytes={start}-{end}')
-            resp = self._get(self.url, headers=headers, stream=True, timeout=30)
-            log(f'线程{idx} HTTP={resp.status_code}')
-            if resp.status_code in (403, 503, 429):
-                raise Exception('服务器拒绝了访问，请更换下载源（如 GitHub Release）或使用浏览器下载')
-            if 'Range' in headers:
-                # 服务器可能忽略/篡改 Range：直接按请求偏移写入会把数据写错位，
-                # 且大小校验不一定能发现（总长度可能恰好一致），必须显式校验。
-                if resp.status_code == 200:
-                    raise Exception('服务器不支持 Range 请求，为避免文件损坏已中止下载')
-                if resp.status_code == 206:
-                    cr = resp.headers.get('Content-Range', '')
-                    m = re.match(r'bytes\s+(\d+)-', cr or '')
-                    if m and int(m.group(1)) != start:
-                        raise Exception(
-                            f'服务器返回的区间与请求不符（期望从 {start} 开始，实际从 {m.group(1)} 开始），'
-                            f'为避免文件损坏已中止下载')
-                    if not m:
-                        log(f'线程{idx} 206 但 Content-Range 无法解析: {cr!r}')
-            resp.raise_for_status()
-            for chunk in resp.iter_content(chunk_size=8192):
-                if self.status != 'running' or gen != self._generation:
-                    stat['status'] = 'stopped'
-                    log(f'线程{idx} 停止: status={self.status}, gen={gen}')
-                    break
-                if end >= 0 and start > end:
-                    # 服务器返回的数据超出请求区间：停止写入，防止覆盖相邻线程的数据
-                    log(f'线程{idx} 数据超出区间 end={end}, 停止')
-                    break
-                if self._thread_speed_limit > 0:
-                    time.sleep(len(chunk) / self._thread_speed_limit * 0.95)
-                with self.lock:
-                    if self.status != 'running' or gen != self._generation:
-                        stat['status'] = 'stopped'
-                        break
-                    self.file.seek(start)
-                    self.file.write(chunk)
-                    self.file.flush()
-                    self.downloaded += len(chunk)
-                    self._bytes_since_update += len(chunk)
-                    stat['downloaded'] += len(chunk)
-                    stat['bytes_since'] += len(chunk)
-                    if stat['span_start'] is None:
-                        stat['span_start'] = start
-                    stat['span_end'] = start + len(chunk) - 1
-                    start += len(chunk)
-                now = time.time()
-                if now - self._last_speed_update > 0.5:
-                    inst_speed = self._bytes_since_update / (now - self._last_speed_update)
-                    self._speed_window.append(inst_speed)
-                    if self._speed_window:
-                        self.speed = sum(self._speed_window) / len(self._speed_window)
-                    self._bytes_since_update = 0
-                    self._last_speed_update = now
-                if now - stat['last_update'] > 0.5:
-                    ds = stat['bytes_since']
-                    dt = now - stat['last_update']
-                    stat['speed'] = ds / dt if dt > 0 else 0
-                    stat['bytes_since'] = 0
-                    stat['last_update'] = now
-            resp.close()
+            while True:
+                cur = pos[0]
+                headers = {}
+                if self._supports_range:
+                    if end >= 0:
+                        headers['Range'] = f'bytes={cur}-{end}'
+                    elif cur > 0:
+                        # 未知大小续传：从 cur 开始；从头下载则不带 Range（空文件服务器会回 416）
+                        headers['Range'] = f'bytes={cur}-'
+                # 服务器已确认不支持 Range：整文件单线程下载，不发 Range 头
+                log(f'线程{idx} 请求: bytes={cur}-{end}' + (f' (重试第{attempt}次)' if attempt else ''))
+                resp = None
+                try:
+                    resp = self._get(self.url, headers=headers, stream=True)
+                    log(f'线程{idx} HTTP={resp.status_code}')
+                    if resp.status_code in (401, 403):
+                        raise curl_requests.exceptions.HTTPError(
+                            '服务器拒绝了访问，请更换下载源（如 GitHub Release）或使用浏览器下载', 0, resp)
+                    self._check_range_response(resp, headers, pos[0], idx)
+                    resp.raise_for_status()
+                    self._pump(idx, resp, pos, end, stat, gen)
+                    resp.close()
+                    resp = None
+                    break  # 本分片完成
+                except Exception as e:
+                    if resp is not None:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                    stopped = self.status != 'running' or gen != self._generation
+                    if stopped or attempt >= self.retry_count or not self._should_retry(e):
+                        raise
+                    delay = self._retry_delay(attempt)
+                    attempt += 1
+                    stat['retries'] = attempt
+                    stat['status'] = 'retrying'
+                    log(f'线程{idx} 第{attempt}次重试，{delay:.1f}s 后从 {cur} 继续: {e}')
+                    if not self._sleep_interruptible(delay, gen):
+                        raise
+                    stat['status'] = 'running'
             stat['status'] = 'completed' if self.status == 'running' else stat['status']
             if gen == self._generation:
                 q.put(('part_done', idx))
@@ -491,6 +658,10 @@ class DownloadTask:
                     if done < self.num_threads:
                         self.status = 'error'
                         self._error_msg = '下载线程意外终止'
+                        with self.lock:
+                            self._spans = self._collect_spans()
+                            self._close_file_locked()
+                        self._save_spans()
                         self._notify('error', self._error_msg)
                     return
                 # 周期性落盘断点区间（崩溃后可续传）
@@ -513,6 +684,9 @@ class DownloadTask:
                 self._error_msg = msg[1]
                 with self.lock:
                     self._spans = self._collect_spans()
+                    # 失败后必须释放 .part 句柄：否则 Windows 上文件被锁住，
+                    # 用户无法删除/移动，重试也可能与之冲突
+                    self._close_file_locked()
                 self._save_spans()
                 self._notify('error', msg[1])
                 return
@@ -590,9 +764,7 @@ class DownloadTask:
             t.join(timeout=0.5)
         self.threads.clear()
         with self.lock:
-            if self.file and not self.file.closed:
-                self.file.close()
-                self.file = None
+            self._close_file_locked()
             self._spans = self._collect_spans()
         self._save_spans()
         self._notify('paused')
@@ -607,9 +779,7 @@ class DownloadTask:
             t.join(timeout=0.5)
         self.threads.clear()
         with self.lock:
-            if self.file and not self.file.closed:
-                self.file.close()
-                self.file = None
+            self._close_file_locked()
             self._spans = self._collect_spans()
         self._save_spans()
         temp = self.save_path + '.part'
@@ -627,6 +797,19 @@ class DownloadTask:
         self._spans = []
         self.downloaded = 0
         self._notify('stopped')
+
+    def _close_file_locked(self):
+        """关闭临时文件（调用方必须已持有 self.lock）"""
+        if self.file and not self.file.closed:
+            try:
+                self.file.flush()
+            except Exception:
+                pass
+            try:
+                self.file.close()
+            except Exception:
+                pass
+        self.file = None
 
     def get_thread_stats(self):
         return dict(self._thread_stats) if hasattr(self, '_thread_stats') else {}

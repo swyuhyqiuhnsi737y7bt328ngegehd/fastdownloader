@@ -9,16 +9,19 @@ from utils import format_size, format_time
 from settings import Settings
 from clipboard_watcher import ClipboardWatcher
 from remote_browser import RemoteServer, load_servers, save_servers
+from task_store import save_tasks, load_tasks, restored_status
 
 STATUS_LABELS = {
     'running':   '正在下载', 'completed': '已完成',
     'error':     '失败',     'paused':    '已暂停',
     'stopped':   '已停止',   'ready':     '等待中',
+    'queued':    '排队中',
 }
 STATUS_COLORS = {
     'running':   '#5dade2', 'completed': '#58d68d',
     'error':     '#ec7063', 'paused':    '#f5b041',
     'stopped':   '#bdc3c7', 'ready':     '#aeb6bf',
+    'queued':    '#8e9aaf',
 }
 
 CATEGORY_RULES = [
@@ -100,6 +103,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.tasks = {}
         self._task_event.connect(self._on_event_gui)
+        self._closing = False
+        self._last_persist = 0.0
         self.next_id = 0
         self._filter = 'all'
         self._hidden = set()
@@ -113,6 +118,12 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._update_ui)
         self._timer.start(500)
         self.clip_watcher = ClipboardWatcher(self, self.on_clipboard_url)
+        try:
+            n = self._restore_tasks()
+            if n:
+                self.status_label.setText(f'已恢复 {n} 个历史任务（点击"继续"即可断点续传）')
+        except Exception:
+            pass
 
     # ---- UI setup ----
 
@@ -359,7 +370,7 @@ class MainWindow(QMainWindow):
         if f == 'all':
             return True
         if f == 'unfinished':
-            return task.status in ('ready', 'running', 'paused', 'stopped', 'error')
+            return task.status in ('ready', 'running', 'paused', 'stopped', 'error', 'queued')
         if f == 'completed':
             return task.status == 'completed'
         exts = CATEGORY_EXTS.get(f, [])
@@ -428,8 +439,14 @@ class MainWindow(QMainWindow):
                 fp = info.get('final_path') or task.save_path
                 QTimer.singleShot(0, lambda fp=fp: QMessageBox.information(self, '下载完成', f'文件已保存到:\n{fp}'))
 
+        self._schedule()          # 有空闲额度就启动排队任务
+        self._persist_tasks()     # 周期性保存任务列表（节流）
+
         total = len(self.tasks) - len(self._hidden)
+        queued = sum(1 for t in self.tasks.values() if t.status == 'queued')
         parts = [f"📦 {total} 个任务"]
+        if queued:
+            parts.append(f"⏳ {queued} 个排队")
         if active:
             parts.append(f"⬇ {active} 个下载中")
         if completed:
@@ -443,32 +460,142 @@ class MainWindow(QMainWindow):
 
     def _start_task_async(self, task):
         """后台线程启动任务：start() 里有 Cookie 读取/HEAD/Range 探测，
-        可能耗时数秒到数十秒，不能阻塞 GUI 线程。"""
-        task._error_notified = False
-        threading.Thread(target=task.start, daemon=True).start()
+        可能耗时数秒到数十秒，不能阻塞 GUI 线程。
 
-    def _add_task(self, url, save_path):
+        _dispatching 标记保证调度器不会在 start() 真正把状态改成 running 之前
+        重复占用并发额度（超发任务）。"""
+        task._error_notified = False
+        task._dispatching = True
+
+        def _run():
+            try:
+                task.start()
+            finally:
+                task._dispatching = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _task_config(self):
+        """把当前设置转换成 DownloadTask 的网络/重试配置"""
+        s = self.settings
+        return dict(
+            num_threads=s.thread_count,
+            speed_limit=s.speed_limit,
+            proxy=s.proxy,
+            headers=s.custom_headers,
+            retry_count=s.retry_count,
+            retry_backoff=s.retry_backoff,
+            connect_timeout=s.connect_timeout,
+            read_timeout=s.read_timeout,
+            verify_ssl=s.verify_ssl,
+        )
+
+    def _add_task(self, url, save_path, priority=0, start_now=True):
         tid = self.next_id
         self.next_id += 1
         save_path = os.path.normpath(save_path)
         task = DownloadTask(tid, url, save_path,
-                            num_threads=self.settings.thread_count,
-                            speed_limit=self.settings.speed_limit,
-                            overwrite=True)
+                            overwrite=True, **self._task_config())
         task.set_callback(self._on_task_event)
+        task.priority = priority
+        task.status = 'queued'
         self.tasks[tid] = task
+        self._create_item(task)
+        if start_now:
+            self._schedule()
+        self._persist_tasks(force=True)
+        self._apply_filter()
+        return task
+
+    def _create_item(self, task):
+        """为任务创建表格行（新增与恢复共用）"""
         item = QTreeWidgetItem(self.table)
-        item.setData(0, Qt.UserRole, tid)
-        item.setText(0, '等待中')
-        item.setText(1, os.path.basename(save_path))
+        item.setData(0, Qt.UserRole, task.task_id)
+        item.setText(0, STATUS_LABELS.get(task.status, task.status))
+        item.setText(1, os.path.basename(task.save_path))
         item.setText(2, '---')
-        item.setData(3, Qt.UserRole, (0.0, 'ready'))
+        item.setData(3, Qt.UserRole, (0.0, task.status))
         item.setText(4, '---')
         item.setText(5, '---')
-        item.setForeground(0, QColor(STATUS_COLORS['ready']))
+        item.setForeground(0, QColor(STATUS_COLORS.get(task.status, '#95a5a6')))
         self.table.addTopLevelItem(item)
-        self._start_task_async(task)
+        return item
+
+    # ---- 队列调度 ----
+
+    def _active_slots(self):
+        """当前占用的并发额度（运行中 + 正在启动）"""
+        return sum(1 for t in self.tasks.values()
+                   if t.status == 'running' or getattr(t, '_dispatching', False))
+
+    def _schedule(self):
+        """在最大并发任务数内按优先级启动排队任务"""
+        if getattr(self, '_closing', False):
+            return
+        limit = max(1, int(self.settings.max_concurrent_tasks))
+        free = limit - self._active_slots()
+        if free <= 0:
+            return
+        pending = [t for t in self.tasks.values() if t.status == 'queued']
+        if not pending:
+            return
+        # 优先级高的先跑；同级按加入顺序（task_id 递增）
+        pending.sort(key=lambda t: (-getattr(t, 'priority', 0), t.task_id))
+        for task in pending[:free]:
+            task.status = 'ready'
+            self._start_task_async(task)
+
+    def _enqueue(self, task):
+        """把任务放回队列等待调度"""
+        if task.status in ('running',):
+            return
+        task.status = 'queued'
+        self._schedule()
+        self._persist_tasks(force=True)
+
+    # ---- 持久化 ----
+
+    def _persist_tasks(self, force=False):
+        now = time.time()
+        if not force and now - self._last_persist < 3:
+            return
+        self._last_persist = now
+        records = []
+        for task in self.tasks.values():
+            info = task.get_info()
+            records.append({
+                'url': task.url,
+                'save_path': task.save_path,
+                'status': info['status'],
+                'downloaded': info['downloaded'],
+                'total': info['total'],
+                'priority': getattr(task, 'priority', 0),
+            })
+        save_tasks(records)
+
+    def _restore_tasks(self):
+        """启动时恢复上次的任务列表（不自动开始下载）"""
+        records = load_tasks()
+        if not records:
+            return 0
+        for rec in records:
+            tid = self.next_id
+            self.next_id += 1
+            task = DownloadTask(tid, rec['url'], os.path.normpath(rec['save_path']),
+                                overwrite=True, **self._task_config())
+            task.set_callback(self._on_task_event)
+            task.priority = rec.get('priority', 0)
+            status = restored_status(rec)
+            task.status = status
+            if status == 'completed':
+                task.downloaded = rec.get('total') or rec.get('downloaded') or 0
+                task.total_size = rec.get('total') or 0
+                task._final_path = rec['save_path']
+                task._notified = True     # 不重复弹"下载完成"
+            self.tasks[tid] = task
+            self._create_item(task)
         self._apply_filter()
+        return len(records)
 
     def _on_task_event(self, tid, event, data=None):
         # 由工作线程（下载线程/monitor）调用：只做线程安全的信号投递，
@@ -510,6 +637,10 @@ class MainWindow(QMainWindow):
         menu.addAction('停止', self.stop_selected)
         menu.addAction('重新下载', self.restart_selected)
         menu.addSeparator()
+        menu.addAction('⏫ 高优先级', lambda: self.set_priority(1))
+        menu.addAction('⏬ 低优先级', lambda: self.set_priority(-1))
+        menu.addAction('➖ 普通优先级', lambda: self.set_priority(-getattr(self.tasks.get(self._get_selected_tid()), 'priority', 0) if self._get_selected_tid() in self.tasks else 0))
+        menu.addSeparator()
         menu.addAction('查看详情', self.show_detail)
         menu.addAction('删除任务', self.delete_selected)
         menu.exec_(self.table.viewport().mapToGlobal(pos))
@@ -531,26 +662,51 @@ class MainWindow(QMainWindow):
     def pause_selected(self):
         tid = self._get_selected_tid()
         if tid is not None and tid in self.tasks:
-            self.tasks[tid].pause()
+            t = self.tasks[tid]
+            if t.status == 'queued':
+                t.status = 'paused'        # 排队中的任务：取消排队（用户可随时继续）
+                self._persist_tasks(force=True)
+            else:
+                t.pause()
 
     def resume_selected(self):
         tid = self._get_selected_tid()
         if tid is not None and tid in self.tasks:
             t = self.tasks[tid]
             if t.status in ('paused', 'ready', 'error'):
-                self._start_task_async(t)
+                self._enqueue(t)           # 有额度立即跑，否则排队
 
     def stop_selected(self):
         tid = self._get_selected_tid()
         if tid is not None and tid in self.tasks:
-            self.tasks[tid].stop()
+            t = self.tasks[tid]
+            if t.status == 'queued':
+                t.status = 'stopped'
+                self._persist_tasks(force=True)
+            else:
+                t.stop()
 
     def restart_selected(self):
         tid = self._get_selected_tid()
         if tid is not None and tid in self.tasks:
             t = self.tasks[tid]
-            t.stop()
-            self._start_task_async(t)
+            if t.status == 'queued':
+                t.status = 'stopped'
+            else:
+                t.stop()
+            self._enqueue(t)
+
+    def set_priority(self, delta):
+        """调整选中任务的优先级（右键菜单）"""
+        tid = self._get_selected_tid()
+        if tid is None or tid not in self.tasks:
+            return
+        t = self.tasks[tid]
+        prio = max(-1, min(1, getattr(t, 'priority', 0) + delta))
+        if prio != getattr(t, 'priority', 0):
+            t.priority = prio
+            self._persist_tasks(force=True)
+            self._schedule()
 
     def delete_selected(self):
         tid = self._get_selected_tid()
@@ -558,26 +714,34 @@ class MainWindow(QMainWindow):
             return
         task = self.tasks.pop(tid, None)
         if task:
-            task.stop()
+            if task.status == 'queued':
+                task.status = 'stopped'    # 还没开始，直接移除，别触发下载
+            else:
+                task.stop()
         item = self._find_item(tid)
         if item is not None:
             self.table.invisibleRootItem().removeChild(item)
         self._hidden.discard(tid)
+        self._persist_tasks(force=True)
 
     def start_all(self):
         for t in self.tasks.values():
             if t.status in ('ready', 'paused', 'error'):
-                self._start_task_async(t)
+                self._enqueue(t)
 
     def pause_all(self):
         for t in self.tasks.values():
             if t.status == 'running':
                 t.pause()
+            elif t.status == 'queued':
+                t.status = 'paused'
 
     def stop_all(self):
         for t in self.tasks.values():
             if t.status in ('running', 'paused'):
                 t.stop()
+            elif t.status == 'queued':
+                t.status = 'stopped'
 
     # ---- Dialogs ----
 
@@ -964,10 +1128,8 @@ class MainWindow(QMainWindow):
             self._add_task(url, save_path)
 
     def _apply_speed_to_tasks(self):
-        limit = self.settings.speed_limit * 1024  # KB/s -> B/s
         for task in self.tasks.values():
-            task.speed_limit = limit
-            task._thread_speed_limit = limit / task.num_threads if task.num_threads else 0
+            task.set_speed_limit(self.settings.speed_limit)  # 运行中立即生效
 
     def toggle_speed(self):
         cur = self.settings.speed_limit
@@ -1024,38 +1186,121 @@ class MainWindow(QMainWindow):
             ok_count += 1
         QMessageBox.information(self, '导入成功', f'已导入 {ok_count} 个任务（共 {len(data)} 条记录）')
 
+    @staticmethod
+    def _parse_headers(text):
+        """把\"Name: Value\"多行文本解析成字典（忽略空行和 # 注释）"""
+        out = {}
+        for line in (text or '').splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or ':' not in line:
+                continue
+            key, value = line.split(':', 1)
+            key = key.strip()
+            if key:
+                out[key] = value.strip()
+        return out
+
+    @staticmethod
+    def _format_headers(headers):
+        return '\n'.join(f'{k}: {v}' for k, v in (headers or {}).items())
+
     def open_settings(self):
         dlg = QDialog(self)
         dlg.setWindowTitle('设置')
-        dlg.resize(380, 200)
+        dlg.resize(520, 560)
         layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setContentsMargins(15, 15, 15, 15)
 
-        layout.addWidget(QLabel('最大线程数'))
-        thread_slider = QSlider(Qt.Horizontal)
-        thread_slider.setRange(1, 16)
-        thread_slider.setValue(self.settings.thread_count)
-        thread_slider.valueChanged.connect(lambda v: setattr(self.settings, 'thread_count', v) or self.settings.save())
-        layout.addWidget(thread_slider)
+        tabs = QTabWidget()
 
-        layout.addSpacing(10)
-        layout.addWidget(QLabel('下载限速 (KB/s, 0=不限速)'))
-        speed_spin = QSpinBox()
-        speed_spin.setRange(0, 99999)
+        # ---- 常规 ----
+        page1 = QWidget()
+        f1 = QFormLayout(page1)
+        thread_spin = QSpinBox(); thread_spin.setRange(1, 16)
+        thread_spin.setValue(self.settings.thread_count)
+        f1.addRow('单任务线程数', thread_spin)
+        conc_spin = QSpinBox(); conc_spin.setRange(1, 64)
+        conc_spin.setValue(self.settings.max_concurrent_tasks)
+        f1.addRow('同时下载任务数', conc_spin)
+        speed_spin = QSpinBox(); speed_spin.setRange(0, 999999); speed_spin.setSuffix(' KB/s')
         speed_spin.setValue(self.settings.speed_limit)
-        def _on_speed_change(v):
-            self.settings.speed_limit = v
+        f1.addRow('全局限速（0=不限）', speed_spin)
+        hint1 = QLabel('线程数作用于单个任务；同时下载任务数决定队列并发上限，\n超出部分自动排队（可用右键菜单调整优先级）。')
+        hint1.setStyleSheet('color: #999999;')
+        f1.addRow(hint1)
+        tabs.addTab(page1, '常规')
+
+        # ---- 网络 ----
+        page2 = QWidget()
+        f2 = QFormLayout(page2)
+        proxy_edit = QLineEdit(self.settings.proxy)
+        proxy_edit.setPlaceholderText('http://127.0.0.1:7890 或 socks5://127.0.0.1:1080（留空=直连）')
+        f2.addRow('代理', proxy_edit)
+        connect_spin = QSpinBox(); connect_spin.setRange(1, 600); connect_spin.setSuffix(' 秒')
+        connect_spin.setValue(self.settings.connect_timeout)
+        f2.addRow('连接超时', connect_spin)
+        read_spin = QSpinBox(); read_spin.setRange(1, 3600); read_spin.setSuffix(' 秒')
+        read_spin.setValue(self.settings.read_timeout)
+        f2.addRow('停滞超时', read_spin)
+        verify_chk = QCheckBox('校验服务器 TLS 证书（自签名证书站点需关闭）')
+        verify_chk.setChecked(bool(self.settings.verify_ssl))
+        f2.addRow(verify_chk)
+        note2 = QLabel('停滞超时：连接后长时间收不到数据即判定失败并重试。')
+        note2.setStyleSheet('color: #999999;')
+        f2.addRow(note2)
+        tabs.addTab(page2, '网络')
+
+        # ---- 重试 ----
+        page3 = QWidget()
+        f3 = QFormLayout(page3)
+        retry_spin = QSpinBox(); retry_spin.setRange(0, 20)
+        retry_spin.setValue(self.settings.retry_count)
+        f3.addRow('分片重试次数', retry_spin)
+        backoff_spin = QDoubleSpinBox(); backoff_spin.setRange(0.0, 60.0)
+        backoff_spin.setSingleStep(0.5); backoff_spin.setSuffix(' 秒')
+        backoff_spin.setValue(float(self.settings.retry_backoff))
+        f3.addRow('初始退避', backoff_spin)
+        note3 = QLabel('失败后按 退避×2ⁿ 重试（含抖动，上限 30 秒），\n并从已写入的位置断点继续，不会重复下载。\n4xx（认证/权限/不存在）不重试。')
+        note3.setStyleSheet('color: #999999;')
+        f3.addRow(note3)
+        tabs.addTab(page3, '重试')
+
+        # ---- 自定义请求头 ----
+        page4 = QWidget()
+        f4 = QVBoxLayout(page4)
+        f4.addWidget(QLabel('每行一个，格式 Name: Value（会覆盖同名默认头）'))
+        headers_edit = QPlainTextEdit(self._format_headers(self.settings.custom_headers))
+        headers_edit.setPlaceholderText('Referer: https://example.com/\nAuthorization: Bearer xxx')
+        f4.addWidget(headers_edit)
+        tabs.addTab(page4, '自定义请求头')
+
+        layout.addWidget(tabs)
+        layout.addSpacing(10)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton('保存并关闭')
+
+        def _apply_settings():
+            self.settings.thread_count = thread_spin.value()
+            self.settings.max_concurrent_tasks = conc_spin.value()
+            self.settings.speed_limit = speed_spin.value()
+            self.settings.proxy = proxy_edit.text().strip()
+            self.settings.connect_timeout = connect_spin.value()
+            self.settings.read_timeout = read_spin.value()
+            self.settings.verify_ssl = verify_chk.isChecked()
+            self.settings.retry_count = retry_spin.value()
+            self.settings.retry_backoff = backoff_spin.value()
+            self.settings.custom_headers = self._parse_headers(headers_edit.toPlainText())
             self.settings.save()
-            self._apply_speed_to_tasks()
-        speed_spin.valueChanged.connect(_on_speed_change)
-        layout.addWidget(speed_spin)
+            self._apply_speed_to_tasks()   # 限速对运行中任务立即生效
+            self._schedule()               # 并发上限调大时立即启动排队任务
+            dlg.accept()
 
-        layout.addSpacing(15)
-        close_btn = QPushButton('关闭')
-        close_btn.clicked.connect(dlg.accept)
-        layout.addWidget(close_btn)
+        close_btn.clicked.connect(_apply_settings)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
         dlg.exec_()
-
     def show_about(self):
         text = ("⚡ 极速下载器 Pro - Fast Downloader Pro\n\n"
                 "\n\n"
@@ -1073,6 +1318,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._closing = True  # 关闭期间不再弹任何错误对话框
         self.settings.save()
+        self._persist_tasks(force=True)   # 保存任务列表，下次启动可恢复
         self.clip_watcher.stop()
         for task in list(self.tasks.values()):
             if task.status == 'running':
