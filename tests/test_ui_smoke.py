@@ -14,6 +14,7 @@ from PyQt5.QtCore import QTimer                        # noqa: E402
 from PyQt5.QtWidgets import QApplication               # noqa: E402
 
 import task_store                                       # noqa: E402
+from ui_helpers import FakeMessageBox, patched_messagebox  # noqa: E402
 import ui as ui_mod                                     # noqa: E402
 
 _app = None
@@ -108,22 +109,42 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(pal.color(pal.Window).name(), '#1e1e1e')
         self.assertEqual(pal.color(pal.WindowText).name(), '#e0e0e0')
 
-    def test_update_dialog_builds_and_closes(self):
-        """更新对话框能构建（含发布说明、资产信息、进度条）并能正常关闭"""
-        from PyQt5.QtWidgets import QMenu
+    def test_update_dialog_builds(self):
+        """更新对话框能构建（发布说明、资产信息、进度条），不需要事件循环"""
         release = {
-            'tag': 'v9.9.9', 'name': 'Release v9.9.9', 'notes': '\n'.join(f'改动 {i}' for i in range(40)),
+            'tag': 'v9.9.9', 'name': 'Release v9.9.9',
+            'notes': '\n'.join(f'改动 {i}' for i in range(40)),
             'html_url': 'https://example.invalid/releases', 'published_at': '',
             'assets': {
                 'FastDownloader.exe': {'url': 'u1', 'size': 1024, 'digest': ''},
                 'fastdownloader.zip': {'url': 'u2', 'size': 2048, 'digest': ''},
             },
         }
-        QTimer.singleShot(300, lambda: (_app.activeModalWidget().reject()
-                                        if _app.activeModalWidget() is not None else _app.quit()))
-        self.win._show_update_dialog(release)
-        self.assertIsNone(self.win._update_dlg)      # exec_ 返回后必须清理引用
-        self.assertIsNone(getattr(self.win, '_update_bar', None))
+        dlg = self.win._build_update_dialog(release)
+        try:
+            texts = [w.text() for w in dlg.findChildren(ui_mod.QLabel)]
+            self.assertTrue(any('v9.9.9' in t for t in texts), texts[:5])
+            notes = dlg.findChildren(ui_mod.QPlainTextEdit)
+            self.assertTrue(notes and '改动 0' in notes[0].toPlainText())
+            buttons = [b.text() for b in dlg.findChildren(ui_mod.QPushButton)]
+            self.assertIn('下载并安装', buttons)
+            self.assertIn('稍后', buttons)
+            self.assertIsNotNone(getattr(self.win, '_update_bar', None))
+        finally:
+            dlg.deleteLater()
+            self.win._update_bar = None
+
+    def test_update_dialog_disables_install_without_matching_asset(self):
+        release = {'tag': 'v9.9.9', 'notes': '', 'html_url': '', 'assets': {
+            'notes.txt': {'url': 'u', 'size': 1, 'digest': ''}}}
+        dlg = self.win._build_update_dialog(release)
+        try:
+            install = [b for b in dlg.findChildren(ui_mod.QPushButton) if b.text() == '下载并安装']
+            self.assertTrue(install and not install[0].isEnabled(),
+                            '没有匹配的安装包时安装按钮应禁用')
+        finally:
+            dlg.deleteLater()
+            self.win._update_bar = None
 
     def test_help_menu_exposes_update_actions(self):
         from PyQt5.QtWidgets import QMenu
@@ -143,6 +164,94 @@ class SmokeTest(unittest.TestCase):
         from version import __version__
         self.assertTrue(__version__)
         self.win.show_about_version = __version__    # 版本号可被引用（不存在则抛 AttributeError）
+
+class SaveDirectoryTest(unittest.TestCase):
+    """下载目录能被修改并真正生效（曾经只能在"保存文件"对话框里间接设置）"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fd_savedir_')
+        self._orig_store = task_store.STORE_FILE
+        task_store.STORE_FILE = os.path.join(self.tmp, 'tasks.json')
+        self.win = ui_mod.MainWindow()
+        self.win.settings.save = lambda: None
+        self._msgbox = patched_messagebox(ui_mod)
+        self._msgbox.__enter__()
+
+    def tearDown(self):
+        self.win._closing = True
+        self.win.close()
+        self._msgbox.__exit__(None, None, None)
+        task_store.STORE_FILE = self._orig_store
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_default_save_path_uses_settings_dir(self):
+        base = os.path.join(self.tmp, 'downloads')
+        self.assertEqual(ui_mod._default_save_path(base, 'https://e.com/a/movie.mp4'),
+                         os.path.normpath(os.path.join(base, 'movie.mp4')))
+        self.assertEqual(ui_mod._default_save_path(base, ''), os.path.normpath(base))
+        self.assertEqual(ui_mod._default_save_path(base, 'not-a-url'), os.path.normpath(base))
+        name = ui_mod._default_save_path(
+            base, 'https://e.com/x?response-content-disposition=attachment;filename=report.pdf')
+        self.assertTrue(name.endswith('report.pdf'), name)
+
+    def test_new_task_lands_in_updated_directory(self):
+        new_dir = os.path.join(self.tmp, 'changed-dir')
+        os.makedirs(new_dir, exist_ok=True)
+        self.win.settings.save_directory = new_dir
+        url = 'http://127.0.0.1:9/movie.mp4'
+        path = ui_mod._default_save_path(self.win.settings.save_directory, url)
+        task = self.win._add_task(url, path)
+        self.assertEqual(os.path.dirname(task.save_path), os.path.normpath(new_dir))
+        self.assertEqual(os.path.basename(task.save_path), 'movie.mp4')
+
+    def test_settings_round_trip_keeps_new_directory(self):
+        import settings as settings_mod
+        from settings import Settings
+        store = os.path.join(self.tmp, 'settings.json')
+        orig = settings_mod.SETTINGS_FILE
+        settings_mod.SETTINGS_FILE = store
+        try:
+            s = Settings()
+            target = os.path.join(self.tmp, 'my downloads')
+            s.save_directory = target
+            s.save()
+            again = Settings()
+            self.assertEqual(again.save_directory, os.path.normpath(target))
+        finally:
+            settings_mod.SETTINGS_FILE = orig
+
+    def test_add_task_dialog_prefills_path_and_is_editable(self):
+        """对话框必须默认填好路径，而且路径框要能手动编辑/粘贴"""
+        from PyQt5.QtWidgets import QLineEdit
+        new_dir = os.path.join(self.tmp, 'dl')
+        os.makedirs(new_dir, exist_ok=True)
+        self.win.settings.save_directory = new_dir
+        captured = {}
+        clipboard = _app.clipboard()
+        saved_text = clipboard.text()
+        clipboard.clear()
+
+        def inspect_and_close():
+            dlg = _app.activeModalWidget()
+            if dlg is None:
+                _app.quit()
+                return
+            edits = dlg.findChildren(QLineEdit)
+            captured['texts'] = [e.text() for e in edits]
+            captured['readonly'] = [e.isReadOnly() for e in edits]
+            dlg.reject()
+
+        QTimer.singleShot(250, inspect_and_close)
+        try:
+            self.win.add_task_dialog()
+        finally:
+            clipboard.setText(saved_text)
+
+        self.assertTrue(captured.get('texts'), '对话框里应有输入框')
+        self.assertTrue(any(new_dir in txt for txt in captured['texts']),
+                        f'保存路径应默认指向设置里的目录: {captured}')
+        self.assertNotIn(True, captured['readonly'], '保存路径框不应是只读的')
 
 
 if __name__ == '__main__':

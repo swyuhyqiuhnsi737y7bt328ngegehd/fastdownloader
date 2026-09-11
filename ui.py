@@ -49,6 +49,21 @@ def _sanitize_filename(name):
     return name or 'download'
 
 
+def _default_save_path(base_dir, url):
+    """按默认下载目录 + 链接推断保存路径。
+
+    链接能识别出文件名时返回 目录/文件名，否则返回目录本身
+    （引擎在保存路径是目录时会自动补文件名）。
+    """
+    base = os.path.normpath(base_dir or os.path.expanduser('~'))
+    url = (url or '').strip()
+    if url.lower().startswith(('http://', 'https://', 'ftp://', 'ftps://')):
+        name = _extract_filename(url)
+        if name:
+            return os.path.normpath(os.path.join(base, name))
+    return base
+
+
 def _extract_filename(url):
     parsed = urllib.parse.urlparse(url)
     params = urllib.parse.parse_qs(parsed.query)
@@ -839,7 +854,7 @@ class MainWindow(QMainWindow):
     def add_task_dialog(self):
         dlg = QDialog(self)
         dlg.setWindowTitle('添加下载任务')
-        dlg.resize(560, 240)
+        dlg.resize(620, 260)
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(18, 18, 18, 18)
 
@@ -848,26 +863,54 @@ class MainWindow(QMainWindow):
         layout.addWidget(url_edit)
 
         layout.addSpacing(8)
-        layout.addWidget(QLabel('保存路径'))
+        layout.addWidget(QLabel('保存到'))
         path_layout = QHBoxLayout()
         path_edit = QLineEdit()
-        path_edit.setReadOnly(True)
+        path_edit.setPlaceholderText('可直接粘贴完整路径，或点右侧按钮选择文件夹')
         path_layout.addWidget(path_edit)
-        browse_btn = QPushButton('浏览')
-        browse_btn.clicked.connect(lambda: self._browse_save(path_edit))
+        browse_btn = QPushButton('选择文件夹')
         path_layout.addWidget(browse_btn)
         layout.addLayout(path_layout)
+        hint = QLabel('留空则使用设置里的默认下载目录；只填目录时会按链接自动生成文件名。')
+        hint.setStyleSheet('color: #b8c4d0;')
+        layout.addWidget(hint)
 
-        # Fill from clipboard
+        # 用户手动改过路径后，就不再被链接变化覆盖
+        manual = {'edited': False}
+
+        def _default_path():
+            return _default_save_path(self.settings.save_directory, url_edit.text())
+
+        def apply_default(*_args):
+            if manual['edited']:
+                return
+            path_edit.setText(_default_path())
+            path_edit.setCursorPosition(0)
+
+        def on_browse():
+            chosen = self._pick_directory(path_edit.text(), '选择下载文件夹')
+            if not chosen:
+                return
+            # 顺手记住为默认下载目录，下次添加任务直接用这里
+            self.settings.save_directory = chosen
+            self.settings.save()
+            manual['edited'] = False
+            apply_default()
+
+        url_edit.textChanged.connect(apply_default)
+        path_edit.textEdited.connect(lambda _t: manual.__setitem__('edited', True))
+        browse_btn.clicked.connect(on_browse)
+
+        # 打开对话框：剪贴板里有链接就填上；无论如何都给出一个默认路径
+        clip = ''
         try:
-            clip = QApplication.clipboard().text()
-            if clip.startswith('http'):
-                url_edit.setText(clip)
-                fn = _extract_filename(clip)
-                base = os.path.normpath(self.settings.save_directory)
-                path_edit.setText(os.path.normpath(os.path.join(base, fn)))
-        except:
+            clip = (QApplication.clipboard().text() or '').strip()
+        except Exception:
             pass
+        if clip.lower().startswith(('http://', 'https://', 'ftp://', 'ftps://')):
+            url_edit.setText(clip)      # 触发 textChanged -> 填充默认路径
+        if not path_edit.text().strip():
+            apply_default()
 
         layout.addSpacing(12)
         btn_layout = QHBoxLayout()
@@ -877,7 +920,14 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(cancel)
         ok = QPushButton('开始下载')
         ok.setStyleSheet("QPushButton { background: #2ecc71; color: white; padding: 6px 20px; border-radius: 3px; }")
-        ok.clicked.connect(lambda: self._submit_task(dlg, url_edit.text().strip(), path_edit.text().strip()))
+
+        def submit():
+            url = url_edit.text().strip()
+            # 路径留空时回落到默认目录（引擎会按链接补文件名）
+            path = path_edit.text().strip() or _default_path()
+            self._submit_task(dlg, url, path)
+
+        ok.clicked.connect(submit)
         btn_layout.addWidget(ok)
         layout.addLayout(btn_layout)
 
@@ -888,13 +938,13 @@ class MainWindow(QMainWindow):
             self._add_task(url, path)
             dlg.accept()
 
-    def _browse_save(self, edit):
-        path, _ = QFileDialog.getSaveFileName(self, '保存文件', self.settings.save_directory)
-        if path:
-            path = os.path.normpath(path)
-            self.settings.save_directory = os.path.dirname(path)
-            self.settings.save()
-            edit.setText(path)
+    def _pick_directory(self, start=None, title='选择文件夹'):
+        """统一的目录选择框：起点是文件路径时自动取其所在目录"""
+        start = (start or '').strip() or self.settings.save_directory or os.path.expanduser('~')
+        if not os.path.isdir(start):
+            start = os.path.dirname(start) or os.path.expanduser('~')
+        chosen = QFileDialog.getExistingDirectory(self, title, start)
+        return os.path.normpath(chosen) if chosen else ''
 
     def batch_download(self):
         dlg = QDialog(self)
@@ -1316,6 +1366,17 @@ class MainWindow(QMainWindow):
         # ---- 常规 ----
         page1 = _dark_page()
         f1 = QFormLayout(page1)
+        dir_edit = QLineEdit(os.path.normpath(self.settings.save_directory or ''))
+        dir_edit.setPlaceholderText('例如 D:\\Downloads')
+        dir_btn = QPushButton('浏览')
+        dir_row = QHBoxLayout()
+        dir_row.setContentsMargins(0, 0, 0, 0)
+        dir_row.addWidget(dir_edit, 1)
+        dir_row.addWidget(dir_btn)
+        f1.addRow('默认下载目录', dir_row)
+        dir_btn.clicked.connect(
+            lambda: dir_edit.setText(self._pick_directory(dir_edit.text(), '选择默认下载目录')
+                                     or dir_edit.text()))
         thread_spin = QSpinBox(); thread_spin.setRange(1, 16)
         thread_spin.setValue(self.settings.thread_count)
         f1.addRow('单任务线程数', thread_spin)
@@ -1401,6 +1462,9 @@ class MainWindow(QMainWindow):
         close_btn = QPushButton('保存并关闭')
 
         def _apply_settings():
+            new_dir = os.path.normpath(dir_edit.text().strip()) if dir_edit.text().strip() else ''
+            if new_dir:
+                self.settings.save_directory = new_dir
             self.settings.thread_count = thread_spin.value()
             self.settings.max_concurrent_tasks = conc_spin.value()
             self.settings.speed_limit = speed_spin.value()
@@ -1431,6 +1495,16 @@ class MainWindow(QMainWindow):
     def _show_update_dialog(self, release):
         if getattr(self, '_update_dlg', None) is not None:
             return
+        dlg = self._build_update_dialog(release)
+        self._update_dlg = dlg
+        try:
+            dlg.exec_()
+        finally:
+            self._update_dlg = None
+            self._update_bar = None
+
+    def _build_update_dialog(self, release):
+        """构建更新对话框（不执行 exec_，便于测试）"""
         dlg = QDialog(self)
         dlg.setWindowTitle('发现新版本')
         dlg.resize(580, 470)
@@ -1477,13 +1551,7 @@ class MainWindow(QMainWindow):
         if not asset_name:
             install_btn.setEnabled(False)
         layout.addLayout(btn_row)
-
-        self._update_dlg = dlg
-        try:
-            dlg.exec_()
-        finally:
-            self._update_dlg = None
-            self._update_bar = None
+        return dlg
 
     def _start_self_update(self, dlg, release):
         kind = updater.detect_install_kind()

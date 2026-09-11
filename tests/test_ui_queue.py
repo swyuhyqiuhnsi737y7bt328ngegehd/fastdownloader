@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import QApplication          # noqa: E402
 import task_store                                  # noqa: E402
 from fault_server import FaultServer               # noqa: E402
 import ui as ui_mod                                # noqa: E402
+from ui_helpers import FakeMessageBox as _FakeMessageBox  # noqa: E402
 
 MB = 1024 * 1024
 _app = None
