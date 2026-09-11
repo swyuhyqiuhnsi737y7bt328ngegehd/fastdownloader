@@ -240,6 +240,7 @@ fastdownloader/
 ├── task_store.py           # 任务列表持久化与恢复
 ├── version.py              # 版本号与仓库地址
 ├── assets/app.ico          # 应用图标（构建时写入 exe 版本资源）
+├── packaging/FIRST_RUN.txt # 随发布包分发的首次运行/白名单说明
 ├── updater.py              # 更新检查 / 下载校验 / 解压 / 后台替换
 ├── tests/                  # 测试（故障注入服务器 + 引擎/队列/GUI 测试）
 ├── requirements.txt        # Python 依赖
@@ -390,11 +391,25 @@ Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
 
 加完之后，记得去**隔离区把已删除的文件还原**，否则程序仍然缺文件。
 
+> 打包好的 zip / 目录版里已经附带一份 **《安装说明（首次运行必读）.txt》**，
+> 内容就是下面这些步骤，解压后第一眼就能看到。
+
 #### 方式 C：不加白名单（更省事）
 
 - 直接**源码运行**：`pip install -r requirements.txt` 后 `python main.py`——杀软几乎不会拦 Python 脚本；
 - 用 **zip 目录版**代替单文件版：没有自解压行为，误报率明显更低；
 - 把程序放在**非系统盘的普通目录**（别放 `C:\Windows`、`%TEMP%`、启动目录这类高危位置）。
+
+#### 顺带一提：别装多套杀软
+
+同时开几套实时防护（比如 360 + 腾讯电脑管家 + Defender）会让误报概率成倍上升，
+它们之间也会互相告警、互相抢文件。留一套你信任的就够了。
+可以用这条命令看看当前注册了几套：
+
+```powershell
+Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct |
+    Select-Object displayName, productState
+```
 
 #### 提交误报，让厂商修掉（推荐同时做）
 

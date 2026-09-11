@@ -272,6 +272,15 @@ def metadata_flags():
         flags += f' --windows-icon-from-ico="{icon}"'
     return flags
 
+
+def write_readme_note(target_dir):
+    """把首次运行/白名单说明放进发布目录"""
+    src = ROOT / "packaging" / "FIRST_RUN.txt"
+    if src.exists() and Path(target_dir).is_dir():
+        dest = Path(target_dir) / "安装说明（首次运行必读）.txt"
+        shutil.copy2(src, dest)
+        print(f"  [OK] Shipped first-run note -> {dest.name}")
+
 def build_onefile(mode="std"):
     """
     构建单文件 exe。
@@ -430,6 +439,7 @@ def build_standalone_upx():
         sys.exit(1)
 
     print("\n=== Running UPX compression ===")
+    write_readme_note(dist_dir)
     saved = compress_with_upx(dist_dir, upx_path)
 
     # ── 统计 ────────────────────────────────────────────

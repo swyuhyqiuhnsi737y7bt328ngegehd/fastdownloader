@@ -137,9 +137,27 @@ def cleanup_dist():
     print("  [OK] Cleaned\n")
 
 
+
+README_NOTE_NAME = "安装说明（被杀软拦截请看这里）.txt"
+
+
+def write_readme_note(target_dir):
+    """把白名单/误报说明放进发布包：用户解压后第一眼就能看到。
+
+    注意：只是放一份说明文本，程序自身不会去碰杀软设置。
+    """
+    note = (target_dir / "安装说明（首次运行必读）.txt")
+    src = ROOT / "packaging" / "FIRST_RUN.txt"
+    if src.exists():
+        shutil.copy2(src, note)
+        print(f"  [OK] Shipped first-run note -> {note.name}")
+    else:
+        print("  [WARN] packaging/FIRST_RUN.txt missing, skipped")
+
 def make_zip():
     zip_path = ROOT / ZIP_NAME
     print(f"=== Packaging -> {ZIP_NAME} ===")
+    write_readme_note(DIST_MAIN)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in DIST_MAIN.rglob("*"):
             if f.is_file() and "__pycache__" not in str(f):
