@@ -146,7 +146,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 16px; font-weight: bold;")
         hl.addWidget(title)
         ver = QLabel("")
-        ver.setStyleSheet("color: #999999;")
+        ver.setStyleSheet("color: #9aa6b2;")
         hl.addWidget(ver)
         hl.addStretch()
         layout.addWidget(hdr)
@@ -294,8 +294,35 @@ class MainWindow(QMainWindow):
         c = QColor(color)
         return c.lighter(130).name()
 
+    @staticmethod
+    def _dark_palette():
+        """深色 QPalette：让风格绘制的图元（箭头/滚动条/禁用文字）也适配深色主题"""
+        pal = QPalette()
+        window = QColor('#1e1e1e')
+        base = QColor('#252525')
+        alt = QColor('#2a2a2a')
+        text = QColor('#e0e0e0')
+        disabled = QColor('#7f8a95')
+        highlight = QColor('#264f78')
+        pal.setColor(QPalette.Window, window)
+        pal.setColor(QPalette.WindowText, text)
+        pal.setColor(QPalette.Base, base)
+        pal.setColor(QPalette.AlternateBase, alt)
+        pal.setColor(QPalette.Text, text)
+        pal.setColor(QPalette.Button, alt)
+        pal.setColor(QPalette.ButtonText, text)
+        pal.setColor(QPalette.BrightText, QColor('#ff6b6b'))
+        pal.setColor(QPalette.ToolTipBase, alt)
+        pal.setColor(QPalette.ToolTipText, text)
+        pal.setColor(QPalette.Highlight, highlight)
+        pal.setColor(QPalette.HighlightedText, QColor('#ffffff'))
+        pal.setColor(QPalette.PlaceholderText, QColor('#8b98a5'))
+        pal.setColor(QPalette.Link, QColor('#5dade2'))
+        for role in (QPalette.Text, QPalette.WindowText, QPalette.ButtonText):
+            pal.setColor(QPalette.Disabled, role, disabled)
+        return pal
     def _apply_theme(self):
-        self.setStyleSheet("""
+        style = """
             QMainWindow { background: #1e1e1e; }
             QWidget { color: #e0e0e0; font-family: 'Segoe UI'; font-size: 9pt; }
             QLabel { color: #e0e0e0; }
@@ -329,8 +356,43 @@ class MainWindow(QMainWindow):
             QScrollBar::handle:vertical { background: #3a3a3a; border-radius: 4px; min-height: 30px; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             QDialog { background: #1e1e1e; }
+            QDialog QLabel, QDialog QCheckBox, QDialog QRadioButton,
+            QDialog QGroupBox, QDialog QTabWidget { color: #e0e0e0; }
+            QDialog QLineEdit, QDialog QComboBox, QDialog QSpinBox,
+            QDialog QDoubleSpinBox, QDialog QPlainTextEdit { color: #e0e0e0; background: #2a2a2a; }
+            QDialog QComboBox QAbstractItemView { color: #e0e0e0; background: #252525;
+                selection-background-color: #264f78; }
+            QToolTip { color: #e0e0e0; background: #2a2a2a; border: 1px solid #3a3a3a; }
             QPlainTextEdit { color: #e0e0e0; background: #2a2a2a; border: 1px solid #3a3a3a; }
-        """)
+            QDoubleSpinBox { color: #e0e0e0; background: #2a2a2a; border: 1px solid #3a3a3a;
+                padding: 2px; border-radius: 2px; }
+            QCheckBox { color: #e0e0e0; spacing: 6px; }
+            QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid #5a5a5a;
+                background: #2a2a2a; border-radius: 2px; }
+            QCheckBox::indicator:checked { background: #3498db; border-color: #3498db; }
+            /* 选项卡：默认页面背景是系统浅色，必须显式设为深色，否则浅色文字看不见 */
+            QTabWidget::pane { border: 1px solid #3a3a3a; background: #1e1e1e; top: -1px; }
+            QTabWidget > QWidget { background: #1e1e1e; }
+            QTabBar { background: #1e1e1e; }
+            QTabBar::tab { background: #2a2a2a; color: #d6dde4; border: 1px solid #3a3a3a;
+                border-bottom: none; padding: 7px 16px; margin-right: 2px; font-size: 9pt; }
+            QTabBar::tab:selected { background: #264f78; color: #ffffff; border-color: #3498db; }
+            QTabBar::tab:hover:!selected { background: #333333; color: #ffffff; }
+            QScrollArea { background: #1e1e1e; border: 1px solid #3a3a3a; }
+            QScrollArea > QWidget > QWidget { background: #1e1e1e; }
+            QScrollArea QLabel { color: #e0e0e0; background: transparent; }
+            QGroupBox { color: #e0e0e0; border: 1px solid #3a3a3a; border-radius: 3px; margin-top: 8px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }
+        """
+        self.setStyleSheet(style)
+        # 同时设置到 QApplication：对话框/消息框若只继承 MainWindow 样式，
+        # 内部控件会退回系统浅色配色，出现"浅底浅字"看不清的问题。
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(style)
+            # 调色板：样式表管不到风格绘制的元素（下拉箭头、滚动条、禁用文字），
+            # 不设的话它们在深色背景上会是系统浅色配色的深色图元，看起来发黑。
+            app.setPalette(self._dark_palette())
 
     def _setup_menu(self):
         bar = self.menuBar()
@@ -1213,8 +1275,17 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
 
+        def _dark_page():
+            """新建选项卡页并强制深色背景（样式表对 QStackedWidget 页面不一定生效）"""
+            page = QWidget()
+            page.setAutoFillBackground(True)
+            pal = page.palette()
+            pal.setColor(page.backgroundRole(), QColor('#1e1e1e'))
+            page.setPalette(pal)
+            return page
+
         # ---- 常规 ----
-        page1 = QWidget()
+        page1 = _dark_page()
         f1 = QFormLayout(page1)
         thread_spin = QSpinBox(); thread_spin.setRange(1, 16)
         thread_spin.setValue(self.settings.thread_count)
@@ -1226,12 +1297,12 @@ class MainWindow(QMainWindow):
         speed_spin.setValue(self.settings.speed_limit)
         f1.addRow('全局限速（0=不限）', speed_spin)
         hint1 = QLabel('线程数作用于单个任务；同时下载任务数决定队列并发上限，\n超出部分自动排队（可用右键菜单调整优先级）。')
-        hint1.setStyleSheet('color: #999999;')
+        hint1.setStyleSheet('color: #b8c4d0;')
         f1.addRow(hint1)
         tabs.addTab(page1, '常规')
 
         # ---- 网络 ----
-        page2 = QWidget()
+        page2 = _dark_page()
         f2 = QFormLayout(page2)
         proxy_edit = QLineEdit(self.settings.proxy)
         proxy_edit.setPlaceholderText('http://127.0.0.1:7890 或 socks5://127.0.0.1:1080（留空=直连）')
@@ -1246,12 +1317,12 @@ class MainWindow(QMainWindow):
         verify_chk.setChecked(bool(self.settings.verify_ssl))
         f2.addRow(verify_chk)
         note2 = QLabel('停滞超时：连接后长时间收不到数据即判定失败并重试。')
-        note2.setStyleSheet('color: #999999;')
+        note2.setStyleSheet('color: #b8c4d0;')
         f2.addRow(note2)
         tabs.addTab(page2, '网络')
 
         # ---- 重试 ----
-        page3 = QWidget()
+        page3 = _dark_page()
         f3 = QFormLayout(page3)
         retry_spin = QSpinBox(); retry_spin.setRange(0, 20)
         retry_spin.setValue(self.settings.retry_count)
@@ -1261,12 +1332,12 @@ class MainWindow(QMainWindow):
         backoff_spin.setValue(float(self.settings.retry_backoff))
         f3.addRow('初始退避', backoff_spin)
         note3 = QLabel('失败后按 退避×2ⁿ 重试（含抖动，上限 30 秒），\n并从已写入的位置断点继续，不会重复下载。\n4xx（认证/权限/不存在）不重试。')
-        note3.setStyleSheet('color: #999999;')
+        note3.setStyleSheet('color: #b8c4d0;')
         f3.addRow(note3)
         tabs.addTab(page3, '重试')
 
         # ---- 自定义请求头 ----
-        page4 = QWidget()
+        page4 = _dark_page()
         f4 = QVBoxLayout(page4)
         f4.addWidget(QLabel('每行一个，格式 Name: Value（会覆盖同名默认头）'))
         headers_edit = QPlainTextEdit(self._format_headers(self.settings.custom_headers))

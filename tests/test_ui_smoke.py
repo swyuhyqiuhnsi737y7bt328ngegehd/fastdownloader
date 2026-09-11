@@ -73,6 +73,41 @@ class SmokeTest(unittest.TestCase):
         self.win._filter = 'unfinished'
         self.assertTrue(self.win._matches_category(task))
 
+    def test_dark_theme_contrast(self):
+        """深色主题回归：文字与背景对比度必须达标
+
+        曾经的 bug：选项卡页面用系统浅色背景，而文字是深色主题的浅灰，
+        结果设置对话框里"浅底浅字"完全看不清。
+        """
+        def lum(color):
+            return 0.2126 * color.redF() + 0.7152 * color.greenF() + 0.0722 * color.blueF()
+
+        def contrast(a, b):
+            l1, l2 = lum(a), lum(b)
+            hi, lo = max(l1, l2), min(l1, l2)
+            return (hi + 0.05) / (lo + 0.05)
+
+        app = QApplication.instance()
+        pal = app.palette()
+        background = pal.color(pal.Window)
+        for name, role in (('WindowText', pal.WindowText), ('Text', pal.Text),
+                           ('ButtonText', pal.ButtonText)):
+            ratio = contrast(pal.color(role), background)
+            self.assertGreaterEqual(ratio, 4.5, f'{name} 对比度仅 {ratio:.2f}（需 ≥ 4.5）')
+
+        # 选项卡页面背景必须在样式表里显式指定为深色
+        style = self.win.styleSheet()
+        self.assertIn('QTabWidget::pane', style)
+        self.assertIn('QTabWidget > QWidget', style)
+        # 主题要同时应用在 QApplication 上，否则对话框会退回系统浅色配色
+        self.assertEqual(app.styleSheet(), style)
+        self.assertGreater(len(style), 1000)
+
+    def test_dark_palette_helper(self):
+        pal = ui_mod.MainWindow._dark_palette()
+        self.assertEqual(pal.color(pal.Window).name(), '#1e1e1e')
+        self.assertEqual(pal.color(pal.WindowText).name(), '#e0e0e0')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
