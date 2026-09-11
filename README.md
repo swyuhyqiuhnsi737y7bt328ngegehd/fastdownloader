@@ -202,6 +202,18 @@ python build.py --clean    # 清理所有构建产物
 > Windows 上 Python 只加载 `.pyd` 后缀扩展模块，且模块依赖的第三方包不会随
 > .dll 分发，该方案已移除。
 
+### 构建失败排查
+
+| 症状 | 原因 / 处理 |
+|------|-------------|
+| 卡住不动，**没有任何输出、CPU 也接近 0** | Nuitka 下载的编译器包不完整。缓存里会留下一个"看着有几十 MB 其实是半截"的 zip，解压失败后 scons 就一直挂着（实测卡过 24 分钟）。构建脚本现在会在开始前 CRC 校验缓存并自动删除损坏包；也可以手动删掉 `.nuitka_cache/downloads/` 下对应的 zip 重跑 |
+| `FATAL: Failed unexpectedly in Scons C backend compilation` | 多半是环境变量 `PROCESSOR_ARCHITECTURE` 缺失（scons 会直接崩）。构建脚本已经 `setdefault` 兜底，直接用 `python -m nuitka` 手工编译才会踩到 |
+| `no such option: --windows-xxx` | Nuitka 的版本资源选项**没有 windows- 前缀**（是 `--company-name` / `--file-version` / `--copyright` …）。`tests/test_build_metadata.py` 会用 `nuitka --help-all` 校验，改构建脚本后跑一下测试即可 |
+| 下载编译器很慢 / 中途断掉 | 编译器包（winlibs gcc）约 **255MB**，来自 GitHub。网络不稳时容易断；可以手动 `curl -L -C - -o <缓存路径> <url>` 续传，再用 `zipfile.testzip()` 验证 |
+| 编译期间机器很卡 | 杀软的实时扫描会逐个检查生成的 .o/.exe。把项目目录、`.nuitka_cache` 加入信任区能明显加速 |
+
+> 首次构建需要下载约 255MB 的 MinGW 工具链并编译 Nuitka 的静态运行库，
+> 之后有缓存会快很多。产物在 `dist/` 下。
 ### 单文件版（`build_onefile.py`）
 
 打包为单个 `dist/FastDownloader.exe`，运行时自动解压到临时目录，双击即用：
