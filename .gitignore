@@ -10,6 +10,11 @@ error_log.txt
 servers.json
 cookie_cache.json
 .nuitka_cache/
+nuitka-crash-report.xml
+fd_build_temp/
+*.onefile-build/
+main.dist/
+main.build/
 dist/
 build_c/
 build_nuitka/
