@@ -3,6 +3,8 @@ __pycache__/
 *.pyo
 *.part
 downloader_settings.json
+tasks.json
+tasks.json.tmp
 download.log
 error_log.txt
 servers.json
