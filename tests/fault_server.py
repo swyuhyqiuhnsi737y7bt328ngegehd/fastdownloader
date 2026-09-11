@@ -96,6 +96,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # ---- 路由 ----
     def do_HEAD(self):
         path = urlparse(self.path).path
+        if path == '/forbidden' and not (self.headers.get('Authorization') or self.headers.get('X-Auth')):
+            self.send_response(403)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
         if path == '/404':
             self.send_response(404)
             self.send_header('Content-Length', '0')
@@ -122,6 +127,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', '0')
             self.end_headers()
             return
+
+        if path == '/forbidden':
+            # 没有认证信息一律 403（测试"先 403，注入 Cookie 后放行"）
+            if not (self.headers.get('Authorization') or self.headers.get('X-Auth')):
+                body = b'forbidden'
+                self.send_response(403)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
 
         if path == '/auth':
             expect = 'Basic ' + __import__('base64').b64encode(b'user:pass').decode()

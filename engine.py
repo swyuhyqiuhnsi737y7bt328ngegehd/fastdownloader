@@ -36,6 +36,10 @@ class RangeNotHonored(Exception):
     """服务器未按请求返回 Range 区间：重试也不会成功，直接向上报告"""
 
 
+class CookieRetry(Exception):
+    """已注入浏览器 Cookie，立刻重发请求（不计入重试次数、不做退避）"""
+
+
 class DiskFullError(Exception):
     """写入时磁盘写满：重试无意义，直接报告并保留 .part 以便清理后续传"""
 
@@ -115,7 +119,8 @@ class DownloadTask:
     def __init__(self, task_id, url, save_path, num_threads=8, speed_limit=0, overwrite=True,
                  proxy='', headers=None, retry_count=3, retry_backoff=1.0,
                  connect_timeout=15, read_timeout=30, verify_ssl=False,
-                 conflict_policy='rename', check_disk_space=True, min_free_mb=100):
+                 conflict_policy='rename', check_disk_space=True, min_free_mb=100,
+                 cookie_mode='auto'):
         self.task_id = task_id
         self.url = url
         self.save_path = save_path
@@ -136,6 +141,10 @@ class DownloadTask:
         self.check_disk_space = bool(check_disk_space)
         self.min_free_mb = max(0, int(min_free_mb))
         self.space_check_interval = 10.0   # 运行中磁盘检查间隔（秒）
+        # 浏览器 Cookie 读取策略：auto=遇到 401/403 才读 / always=每次注入 / off=不读
+        mode = str(cookie_mode or 'auto').lower()
+        self.cookie_mode = mode if mode in ('auto', 'always', 'off') else 'auto'
+        self._cookies_loaded = False
         # 开始时目标文件是否已存在（覆盖策略或断点续传时，它就是我们要替换的文件）
         self._target_owned = False
         self.total_size = 0
@@ -235,6 +244,32 @@ class DownloadTask:
             gaps.append((cur, hi))
         return gaps
 
+    # ---- 浏览器 Cookie（按需加载）----
+
+    def _load_browser_cookies(self):
+        """读取并注入浏览器 Cookie（幂等：只读一次）。
+
+        默认只在服务器明确要求认证时才调用：读取浏览器 Cookies 数据库并做
+        DPAPI 解密属于高敏感行为，普通下载完全不需要触碰它。
+        返回本次注入的 Cookie 数量。
+        """
+        if self._cookies_loaded:
+            return 0
+        self._cookies_loaded = True
+        if self.cookie_mode == 'off':
+            return 0
+        if _is_loopback(self.url):
+            log('本机地址，跳过浏览器 cookie')
+            return 0
+        try:
+            n = apply_cookies_to_session(self._session, self.url)
+            if n > 0:
+                log(f'成功导入 {n} 个 cookie')
+            return n
+        except Exception as e:
+            log(f'cookie 导入失败: {e}')
+            return 0
+
     # ---- 文件名冲突策略 ----
 
     def _resolve_conflict(self):
@@ -318,8 +353,20 @@ class DownloadTask:
                     self._supports_range = (resp2.status_code == 206)
                     return size
             elif resp.status_code == 403:
+                # 先试浏览器 Cookie（毫秒级），不行再动用 Playwright（要开浏览器）
+                if self._load_browser_cookies():
+                    retry = self._head(self.url, allow_redirects=True, timeout=10)
+                    log(f'注入 cookie 后 HEAD: {retry.status_code}')
+                    if retry.status_code == 200:
+                        length = retry.headers.get('Content-Length')
+                        if length:
+                            size = int(length)
+                            resp2 = self._get(self.url, headers={'Range': 'bytes=0-0'}, timeout=10)
+                            self._supports_range = (resp2.status_code == 206)
+                            return size
                 log('HEAD 403，尝试 Playwright 浏览器处理...')
-                pw_result = resolve_cookies(self.url) if pw_available() else None
+                # 本机地址启动浏览器毫无意义（也拖慢失败判定）
+                pw_result = resolve_cookies(self.url) if (pw_available() and not _is_loopback(self.url)) else None
                 if pw_result:
                     apply_playwright_cookies(self._session, pw_result)
                     resp = self._head(self.url, allow_redirects=True, timeout=10)
@@ -331,7 +378,7 @@ class DownloadTask:
                             resp2 = self._get(self.url, headers={'Range': 'bytes=0-0'}, timeout=10)
                             self._supports_range = (resp2.status_code == 206)
                             return size
-                if pw_available():
+                if pw_available() and not _is_loopback(self.url):
                     self._use_playwright = True
                     return 0  # Will download via Playwright directly
                 self._error_msg = '服务器拒绝了访问，已尝试浏览器 cookie 但仍无法下载'
@@ -344,8 +391,16 @@ class DownloadTask:
                     self._supports_range = True
                     return int(cr.split('/')[-1])
             elif resp.status_code == 403:
+                if self._load_browser_cookies():
+                    retry = self._get(self.url, headers={'Range': 'bytes=0-0'}, timeout=10)
+                    log(f'注入 cookie 后 Range: {retry.status_code}')
+                    if retry.status_code == 206:
+                        cr = retry.headers.get('Content-Range', '')
+                        if '/' in cr:
+                            self._supports_range = True
+                            return int(cr.split('/')[-1])
                 log('Range 403，尝试 Playwright 浏览器处理...')
-                pw_result = resolve_cookies(self.url) if pw_available() else None
+                pw_result = resolve_cookies(self.url) if (pw_available() and not _is_loopback(self.url)) else None
                 if pw_result:
                     apply_playwright_cookies(self._session, pw_result)
                     resp = self._get(self.url, headers={'Range': 'bytes=0-0'}, timeout=10)
@@ -355,7 +410,7 @@ class DownloadTask:
                         if '/' in cr:
                             self._supports_range = True
                             return int(cr.split('/')[-1])
-                    if pw_available():
+                    if pw_available() and not _is_loopback(self.url):
                         self._use_playwright = True
                         return 0
                 self._error_msg = '服务器拒绝了访问，已尝试浏览器模拟但仍无法下载'
@@ -385,16 +440,12 @@ class DownloadTask:
             self._final_path = None
             self._error_msg = ''
 
-        # 自动导入浏览器 cookie（回环地址不需要，跳过可省去数秒的浏览器数据库扫描）
-        if _is_loopback(self.url):
-            log('本机地址，跳过浏览器 cookie')
+        # 浏览器 Cookie：默认按需（碰到 401/403 再读），避免每次下载都去解密
+        # 浏览器的 Cookies 数据库——既省几秒启动时间，也减少杀软关注的行为。
+        if self.cookie_mode == 'always':
+            self._load_browser_cookies()
         else:
-            try:
-                n = apply_cookies_to_session(self._session, self.url)
-                if n > 0:
-                    log(f'成功导入 {n} 个 cookie')
-            except Exception as e:
-                log(f'cookie 导入失败: {e}')
+            log(f'cookie 模式={self.cookie_mode}，按需加载')
 
         # 如果保存路径是目录，自动生成文件名
         if os.path.isdir(self.save_path) or self.save_path.endswith(('\\', '/')):
@@ -706,6 +757,10 @@ class DownloadTask:
                     resp = self._get(self.url, headers=headers, stream=True)
                     log(f'线程{idx} HTTP={resp.status_code}')
                     if resp.status_code in (401, 403):
+                        # 服务器要认证：这时才去读浏览器 Cookie，注入后立刻重发一次
+                        if not self._cookies_loaded and self.cookie_mode != 'off':
+                            if self._load_browser_cookies():
+                                raise CookieRetry()
                         raise curl_requests.exceptions.HTTPError(
                             '服务器拒绝了访问，请更换下载源（如 GitHub Release）或使用浏览器下载', 0, resp)
                     self._check_range_response(resp, headers, pos[0], idx)
@@ -714,6 +769,16 @@ class DownloadTask:
                     resp.close()
                     resp = None
                     break  # 本分片完成
+                except CookieRetry:
+                    # 刚注入 Cookie：直接重发，不消耗重试次数也不退避
+                    if resp is not None:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                    resp = None
+                    stat['status'] = 'running'
+                    continue
                 except Exception as e:
                     if resp is not None:
                         try:

@@ -148,6 +148,17 @@ def run(cmd, label=""):
     return True
 
 
+def _upx_warning():
+    """UPX 说明：加壳通常会让杀软误报更严重，不建议用于对外分发。
+
+    UPX 是最常见的恶意软件加壳工具之一，未签名的程序再叠一层壳会明显抬高
+    启发式评分（不是降低）。体积收益对 onefile 也已经很小——Nuitka 自己就用
+    zstd 压过 payload。真要减少误报，正确顺序是：补全版本资源/图标 ->
+    减少敏感行为 -> 代码签名 ->（实在要壳也别用 UPX，用商业壳或 VMProtect 之类）。
+    """
+    print("  [NOTE] UPX 加壳会提高杀软误报率（恶意软件常用 UPX，未签名程序尤其明显）")
+    print("         体积收益有限；如需分发，建议改用代码签名而不是加壳。")
+
 def check_upx():
     """检查 UPX 是否可用，返回路径或 None"""
     try:
@@ -234,6 +245,33 @@ def _exclude_flags(packages):
     return " ".join(f"--nofollow-import-to={p}" for p in packages)
 
 
+
+def metadata_flags():
+    """Windows 版本资源（产品名/公司/版本/版权/图标）。
+
+    没有这些元数据的 exe 在杀软眼里就是"来源不明的可执行文件"，
+    启发式评分更高；补上元数据是最省事、最有效的一步（比加壳有效得多）。
+    """
+    sys.path.insert(0, str(ROOT))
+    try:
+        from version import __version__
+        raw = (__version__.split('.') + ['0', '0', '0', '0'])[:4]
+        ver4 = '.'.join(raw)
+    except Exception:
+        ver4 = '0.0.0.0'
+    flags = (
+        ' --windows-company-name="FastDownloader"'
+        ' --windows-product-name="Fast Downloader Pro"'
+        ' --windows-file-description="Fast Downloader Pro - 多线程下载器"'
+        f' --windows-file-version={ver4}'
+        f' --windows-product-version={ver4}'
+        ' --windows-copyright="MIT License"'
+    )
+    icon = ROOT / 'assets' / 'app.ico'
+    if icon.exists():
+        flags += f' --windows-icon-from-ico="{icon}"'
+    return flags
+
 def build_onefile(mode="std"):
     """
     构建单文件 exe。
@@ -263,6 +301,7 @@ def build_onefile(mode="std"):
         f' --assume-yes-for-downloads'
         f' --windows-console-mode=disable'
         f' --output-dir="{DIST}"'
+        f'{metadata_flags()}'
         f' {plugin_flags}'
         f' {include_flags}'
         f' {data_flags}'
@@ -351,6 +390,7 @@ def build_standalone_upx():
     print("=== Building Standalone + UPX (Ultra-Small) ===\n")
 
     # 检查 UPX
+    _upx_warning()
     upx_path = check_upx()
     if not upx_path:
         print("  [FAIL] UPX not found!")

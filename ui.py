@@ -586,6 +586,7 @@ class MainWindow(QMainWindow):
             conflict_policy=s.conflict_policy,
             check_disk_space=s.check_disk_space,
             min_free_mb=s.min_free_mb,
+            cookie_mode=s.cookie_mode,
         )
 
     def _add_task(self, url, save_path, priority=0, start_now=True):
@@ -1425,7 +1426,16 @@ class MainWindow(QMainWindow):
         verify_chk = QCheckBox('校验服务器 TLS 证书（自签名证书站点需关闭）')
         verify_chk.setChecked(bool(self.settings.verify_ssl))
         f2.addRow(verify_chk)
-        note2 = QLabel('停滞超时：连接后长时间收不到数据即判定失败并重试。')
+        cookie_combo = QComboBox()
+        cookie_combo.addItem('自动：服务器要求认证时才读取', 'auto')
+        cookie_combo.addItem('始终读取浏览器 Cookie', 'always')
+        cookie_combo.addItem('不使用浏览器 Cookie', 'off')
+        _cidx = cookie_combo.findData(getattr(self.settings, 'cookie_mode', 'auto'))
+        cookie_combo.setCurrentIndex(_cidx if _cidx >= 0 else 0)
+        f2.addRow('浏览器 Cookie', cookie_combo)
+        note2 = QLabel('停滞超时：连接后长时间收不到数据即判定失败并重试。\n'
+                       'Cookie 选"自动"时，普通下载不会读取浏览器数据，\n'
+                       '只有服务器返回 401/403 需要登录态时才去读取。')
         note2.setStyleSheet('color: #b8c4d0;')
         f2.addRow(note2)
         tabs.addTab(page2, '网络')
@@ -1478,6 +1488,7 @@ class MainWindow(QMainWindow):
             self.settings.conflict_policy = policy_combo.currentData()
             self.settings.check_disk_space = disk_chk.isChecked()
             self.settings.min_free_mb = free_spin.value()
+            self.settings.cookie_mode = cookie_combo.currentData()
             self.settings.check_update_on_start = update_chk.isChecked()
             self.settings.save()
             self._apply_speed_to_tasks()   # 限速对运行中任务立即生效

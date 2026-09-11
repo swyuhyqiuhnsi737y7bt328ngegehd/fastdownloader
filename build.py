@@ -76,6 +76,33 @@ def clean():
     print("  [OK] Cleaned\n")
 
 
+
+def metadata_flags():
+    """Windows 版本资源（产品名/公司/版本/版权/图标）。
+
+    没有这些元数据的 exe 在杀软眼里就是"来源不明的可执行文件"，
+    启发式评分更高；补上元数据是最省事、最有效的一步（比加壳有效得多）。
+    """
+    sys.path.insert(0, str(ROOT))
+    try:
+        from version import __version__
+        raw = (__version__.split('.') + ['0', '0', '0', '0'])[:4]
+        ver4 = '.'.join(raw)
+    except Exception:
+        ver4 = '0.0.0.0'
+    flags = (
+        ' --windows-company-name="FastDownloader"'
+        ' --windows-product-name="Fast Downloader Pro"'
+        ' --windows-file-description="Fast Downloader Pro - 多线程下载器"'
+        f' --windows-file-version={ver4}'
+        f' --windows-product-version={ver4}'
+        ' --windows-copyright="MIT License"'
+    )
+    icon = ROOT / 'assets' / 'app.ico'
+    if icon.exists():
+        flags += f' --windows-icon-from-ico="{icon}"'
+    return flags
+
 def build_main():
     """
     编译 main.py 为独立 exe（内嵌全部项目模块与第三方依赖，免安装 Python）。
@@ -91,6 +118,7 @@ def build_main():
         f' --enable-plugin=pyqt5'
         f' --windows-console-mode=disable'
         f' --output-dir="{DIST}"'
+        f'{metadata_flags()}'
         f' "{ROOT / "main.py"}"'
     )
     run(cmd, "main.exe")

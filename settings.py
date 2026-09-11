@@ -22,6 +22,7 @@ DEFAULTS = {
     'check_disk_space': True,    # 下载前检查磁盘剩余空间
     'min_free_mb': 100,          # 磁盘保留安全余量（MB），低于该值时自动暂停
     'check_update_on_start': True,  # 启动时检查 GitHub Releases 是否有新版本
+    'cookie_mode': 'auto',       # 浏览器 Cookie：auto 按需 / always 始终注入 / off 不使用
 }
 
 # 数值型字段的合法范围（越界一律回退默认值）
@@ -66,6 +67,9 @@ def _clean(key, value):
         return os.path.normpath(value)
     if key == 'proxy':
         return value.strip() if isinstance(value, str) else default
+    if key == 'cookie_mode':
+        mode = str(value).lower() if isinstance(value, str) else ''
+        return mode if mode in ('auto', 'always', 'off') else default
     if key == 'conflict_policy':
         policy = str(value).lower() if isinstance(value, str) else ''
         return policy if policy in ('rename', 'overwrite', 'skip') else default
