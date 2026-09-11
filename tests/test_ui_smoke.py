@@ -253,6 +253,76 @@ class SaveDirectoryTest(unittest.TestCase):
                         f'保存路径应默认指向设置里的目录: {captured}')
         self.assertNotIn(True, captured['readonly'], '保存路径框不应是只读的')
 
+    def test_av_help_dialog_builds_and_never_touches_av(self):
+        """误报自助对话框：能构建、给出路径和哈希、且不执行任何修改杀软的操作"""
+        dlg = self.win._build_av_help_dialog()
+        try:
+            texts = ' '.join(w.text() for w in dlg.findChildren(ui_mod.QLabel))
+            self.assertIn('不会', texts)              # 明确声明不代劳
+            self.assertIn('排除项', texts)
+            buttons = [b.text() for b in dlg.findChildren(ui_mod.QPushButton)]
+            self.assertIn('复制 Defender 排除命令', buttons)
+            self.assertIn('复制 SHA256', buttons)
+        finally:
+            dlg.deleteLater()
+
+    def test_av_help_disables_exclusion_button_for_source_runs(self):
+        """源码运行没有 exe 可排除，按钮应禁用（且不写剪贴板）"""
+        dlg = self.win._build_av_help_dialog()
+        try:
+            copies = [b for b in dlg.findChildren(ui_mod.QPushButton)
+                      if b.text() == '复制 Defender 排除命令']
+            self.assertTrue(copies)
+            self.assertFalse(copies[0].isEnabled())
+        finally:
+            dlg.deleteLater()
+
+    def test_av_help_copy_button_only_copies(self):
+        """复制按钮只写剪贴板，绝不执行任何命令（防越界回归）"""
+        import subprocess as _sp
+        import updater as updater_mod
+
+        clipboard = _app.clipboard()
+        saved = clipboard.text()
+        clipboard.clear()              # 绝不读取/泄露用户自己的剪贴板内容
+        called = []
+        orig_popen = _sp.Popen
+        orig_kind = updater_mod.detect_install_kind
+        orig_root = updater_mod.install_root
+        try:
+            _sp.Popen = lambda *a, **k: called.append(a) or orig_popen
+            fake_exe = os.path.join(self.tmp, 'FastDownloader.exe')
+            with open(fake_exe, 'wb') as f:
+                f.write(b'MZ fake')
+            # 伪装成打包版，才能验证按钮的真实行为
+            updater_mod.detect_install_kind = lambda kind=None: 'onefile'
+            updater_mod.install_root = lambda kind=None: fake_exe
+
+            dlg = self.win._build_av_help_dialog()
+            try:
+                copies = [b for b in dlg.findChildren(ui_mod.QPushButton)
+                          if b.text() == '复制 Defender 排除命令']
+                self.assertTrue(copies)
+                self.assertTrue(copies[0].isEnabled())
+                copies[0].click()
+                self.assertEqual(called, [], '复制按钮不允许执行任何外部命令')
+                self.assertIn('ExclusionPath', clipboard.text())
+                self.assertIn(fake_exe, clipboard.text())
+                digest, info = self.win._self_hash_text()
+                self.assertEqual(len(digest), 64)      # sha256 十六进制
+            finally:
+                dlg.deleteLater()
+        finally:
+            _sp.Popen = orig_popen
+            updater_mod.detect_install_kind = orig_kind
+            updater_mod.install_root = orig_root
+            clipboard.setText(saved)
+
+    def test_self_hash_reports_source_mode(self):
+        digest, info = self.win._self_hash_text()
+        self.assertIsNone(digest)
+        self.assertIn('源码', info)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

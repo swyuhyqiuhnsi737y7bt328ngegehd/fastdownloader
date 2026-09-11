@@ -449,6 +449,7 @@ class MainWindow(QMainWindow):
         hm = bar.addMenu('帮助')
         hm.addAction('检查更新', lambda: self.check_updates(silent=False))
         hm.addAction('打开发布页面', self.open_releases_page)
+        hm.addAction('被杀软误报了？', self.show_av_help)
         hm.addSeparator()
         hm.addAction('关于', self.show_about)
 
@@ -1613,6 +1614,114 @@ class MainWindow(QMainWindow):
             self, '更新已就绪',
             '新版本已下载完成。\n\n程序将立即退出，随后自动替换文件并重新启动。')
         self.close()      # 走 closeEvent：保存设置/任务列表并停止下载
+
+    # ---- 杀软误报自助 ----
+
+    def _self_hash_text(self):
+        """本程序文件的 SHA256（打包版才有意义）"""
+        import hashlib
+        target = updater.install_root()
+        if updater.detect_install_kind() == 'source':
+            return None, '源码运行模式，无需校验'
+        if not os.path.isfile(target):
+            return None, '当前是目录版，请对 main.exe 计算哈希'
+        try:
+            h = hashlib.sha256()
+            with open(target, 'rb') as f:
+                for chunk in iter(lambda: f.read(1 << 20), b''):
+                    h.update(chunk)
+            return h.hexdigest(), target
+        except OSError as e:
+            return None, f'读取失败: {e}'
+
+    def show_av_help(self):
+        dlg = self._build_av_help_dialog()
+        dlg.exec_()
+
+    def _build_av_help_dialog(self):
+        """误报自助说明（只读文本 + 复制按钮，不执行任何提权操作）。
+
+        程序绝不会去修改杀软设置：自动关闭/规避杀软属于恶意软件行为，
+        也会被 Defender 判为篡改。加不加白名单由用户自己决定并手动执行。
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle('被杀毒软件误报了？')
+        dlg.resize(640, 520)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 18, 18, 18)
+
+        target = updater.install_root()
+        kind = updater.detect_install_kind()
+        kind_text = {'onefile': '单文件版', 'standalone': '目录版', 'source': '源码运行'}.get(kind, kind)
+        digest, info = self._self_hash_text()
+
+        lines = [
+            '<b>本程序不会也不能替你关闭杀毒软件</b>',
+            '自动规避杀软属于恶意软件行为，也会被杀软判为"篡改防护"。',
+            '是否加白名单，请你自己判断后手动操作。',
+            '',
+            '<b>加白名单之前，先确认文件没被篡改：</b>',
+        ]
+        if digest:
+            lines.append(f'当前文件：{info}')
+            lines.append(f'SHA256：{digest}')
+            lines.append('和 Release 说明里公布的哈希比对，一致才继续。')
+        else:
+            lines.append(info)
+        lines += [
+            '',
+            '<b>Windows 安全中心（Defender）加入排除项：</b>',
+            '设置 → 隐私和安全性 → Windows 安全中心 → 病毒和威胁防护',
+            '→ "病毒和威胁防护"设置 → 管理设置 → 排除项 → 添加或删除排除项',
+            f'→ 添加排除项 → 选择"文件"或"文件夹" → 选中下面这个路径：',
+            f'　{target}',
+            '',
+            '也可以自己以【管理员】身份打开 PowerShell，粘贴程序里复制的命令执行。',
+            '',
+            '<b>使用第三方杀软（360 / 火绒 / 腾讯电脑管家 / 卡巴斯基等）：</b>',
+            '在其设置里找到"信任区 / 排除项 / 白名单"，把上面的路径加进去，',
+            '然后把被隔离的文件从"隔离区"还原。',
+            '',
+            '<b>不想加白名单？</b>可以直接用源码运行（python main.py），或下载 zip 目录版，',
+            '目录版的误报率明显低于单文件版。',
+        ]
+        label = QLabel('<br>'.join(lines))
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(label)
+        layout.addWidget(scroll, 1)
+
+        btn_row = QHBoxLayout()
+        cmd_btn = QPushButton('复制 Defender 排除命令')
+
+        def copy_cmd():
+            cmd = f"Add-MpPreference -ExclusionPath '{target}'"
+            QApplication.clipboard().setText(cmd)
+            QMessageBox.information(
+                dlg, '已复制',
+                '命令已复制。\n\n请自行以【管理员】身份打开 PowerShell，粘贴执行：\n'
+                '（程序不会替你执行任何提权或修改杀软设置的操作）')
+
+        cmd_btn.clicked.connect(copy_cmd)
+        cmd_btn.setEnabled(kind != 'source')
+        btn_row.addWidget(cmd_btn)
+        hash_btn = QPushButton('复制 SHA256')
+        hash_btn.setEnabled(bool(digest))
+        hash_btn.clicked.connect(lambda: (QApplication.clipboard().setText(digest or ''),
+                                          QMessageBox.information(dlg, '已复制', 'SHA256 已复制到剪贴板')))
+        btn_row.addWidget(hash_btn)
+        page_btn = QPushButton('打开发布页面')
+        page_btn.clicked.connect(self.open_releases_page)
+        btn_row.addWidget(page_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton('关闭')
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        return dlg
 
     def open_releases_page(self):
         QDesktopServices.openUrl(QUrl(updater.RELEASES_PAGE))

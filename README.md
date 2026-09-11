@@ -325,15 +325,88 @@ UPX 是最常被恶意软件使用的壳，杀软对它的启发式规则很激�
 所以本项目的构建默认不加壳（`--standalone-upx` 仅作为极限体积的实验性选项，
 运行时会打印警告）。真要压体积，优先 `--tiny`。
 
-### 误报了怎么办
+### 误报了怎么办：自己加白名单
 
-1. **先自查**：用 `certutil -hashfile FastDownloader.exe SHA256` 比对 Release 说明里的哈希，
-   确认文件没被篡改；
-2. **提交误报申诉**（免费，通常 1-2 天处理）：
-   <https://www.microsoft.com/en-us/wdsi/filesubmission>（微软）
-   / <https://www.virustotal.com/>（先看有多少家报、报什么名字）；
-3. **暂时绕过**：把安装目录加入杀软白名单，或直接用源码运行 / 目录版 zip；
-4. **根治**：给 exe 买一张代码签名证书（OV 约 $100-200/年，EV 更贵），签名后误报基本消失。
+> **本程序不会、也不会尝试去关闭或绕过杀毒软件。**
+> 自动规避杀软是恶意软件的行为，而且会被杀软判为"篡改防护"（Defender 就会报
+> `VirTool:Win32/DefenderTamperingRestore`），只会让情况更糟。
+> 是否信任本程序、要不要加白名单，请**由你自己判断并手动操作**。
+
+#### 第 0 步：先确认文件确实没被篡改
+
+不要给来路不明的文件加白名单。先核对哈希：
+
+```bat
+:: 单文件版
+certutil -hashfile FastDownloader.exe SHA256
+
+:: 目录版（对 main.exe）
+certutil -hashfile main.exe SHA256
+```
+
+把输出和 Release 说明里公布的 SHA256 比对——**一致再加白名单**。
+程序里也有现成入口：**帮助 → 被杀软误报了？**，可以直接复制当前文件的 SHA256 和排除命令。
+
+#### 方式 A：Windows 安全中心（Defender）
+
+图形界面：
+
+1. 打开 **设置 → 隐私和安全性 → Windows 安全中心**
+2. 点 **病毒和威胁防护 → "病毒和威胁防护"设置 → 管理设置**
+3. 拉到底部 **排除项 → 添加或删除排除项**
+4. **添加排除项**，选择：
+   - 单文件版 → 选 **文件**，指向 `FastDownloader.exe`
+   - 目录版 → 选 **文件夹**，指向解压出来的整个目录
+5. 如果文件已经被隔离：**保护历史记录 → 找到该威胁 → 操作 → 还原**
+
+命令行（自己以**管理员**身份打开 PowerShell 执行）：
+
+```powershell
+# 单文件版（把路径换成你的实际位置）
+Add-MpPreference -ExclusionPath 'D:\FastDownloader.exe'
+
+# 目录版
+Add-MpPreference -ExclusionPath 'D:\fastdownloader'
+
+# 查看已添加的排除项
+Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
+
+# 想撤销：
+# Remove-MpPreference -ExclusionPath 'D:\FastDownloader.exe'
+```
+
+> 程序里的"复制 Defender 排除命令"按钮只是把上面这条命令放进剪贴板，
+> **不会替你执行**——提权和修改杀软设置必须由你本人确认。
+
+#### 方式 B：第三方杀软
+
+| 软件 | 加白名单的位置 |
+|------|----------------|
+| 360 安全卫士 / 杀毒 | 设置 → 白名单 → 添加目录（或"信任区"） |
+| 火绒安全 | 防护中心 → 信任区 → 添加文件/目录 |
+| 腾讯电脑管家 | 病毒查杀 → 设置 → 白名单 → 添加文件/目录 |
+| 卡巴斯基 | 设置 → 威胁与排除项 → 管理排除项 → 添加 |
+| 诺顿 / Avast / ESET | 设置里搜"排除项 / Exclusions / 例外"，添加文件或目录 |
+
+加完之后，记得去**隔离区把已删除的文件还原**，否则程序仍然缺文件。
+
+#### 方式 C：不加白名单（更省事）
+
+- 直接**源码运行**：`pip install -r requirements.txt` 后 `python main.py`——杀软几乎不会拦 Python 脚本；
+- 用 **zip 目录版**代替单文件版：没有自解压行为，误报率明显更低；
+- 把程序放在**非系统盘的普通目录**（别放 `C:\Windows`、`%TEMP%`、启动目录这类高危位置）。
+
+#### 提交误报，让厂商修掉（推荐同时做）
+
+- 微软：<https://www.microsoft.com/en-us/wdsi/filesubmission>（选 "Software developer" 或
+  "File submitted is clean but detected"）——免费，通常 1-2 天处理，处理完全球用户都不再误报；
+- 先上传 <https://www.virustotal.com/> 看看有多少家报、报什么名字，申诉时附上链接更有效。
+
+#### 根治：代码签名
+
+买一张代码签名证书（OV 约 $100-200/年）给 exe 签名，是唯一能让误报**基本消失**的办法。
+本项目没有签名证书，所以打包版始终可能被个别杀软误报——这也是为什么上面反复强调
+"确认哈希再加白名单"。
 
 > 本程序不会上传任何数据：唯一的出网行为是下载你添加的链接、读取 release 检查更新，
 > 以及（可选）通过 Playwright 打开站点取 Cookie。所有本地文件读写都限于你指定的下载目录与程序数据目录。
