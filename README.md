@@ -210,6 +210,8 @@ python build.py --clean    # 清理所有构建产物
 | `FATAL: Failed unexpectedly in Scons C backend compilation` | 多半是环境变量 `PROCESSOR_ARCHITECTURE` 缺失（scons 会直接崩）。构建脚本已经 `setdefault` 兜底，直接用 `python -m nuitka` 手工编译才会踩到 |
 | `no such option: --windows-xxx` | Nuitka 的版本资源选项**没有 windows- 前缀**（是 `--company-name` / `--file-version` / `--copyright` …）。`tests/test_build_metadata.py` 会用 `nuitka --help-all` 校验，改构建脚本后跑一下测试即可 |
 | 下载编译器很慢 / 中途断掉 | 编译器包（winlibs gcc）约 **255MB**，来自 GitHub。网络不稳时容易断；可以手动 `curl -L -C - -o <缓存路径> <url>` 续传，再用 `zipfile.testzip()` 验证 |
+| `gcc.exe: fatal error: could not write to temporary response file ...` | **临时目录所在盘没空间了**。链接阶段 gcc 要写响应文件，报错却完全看不出是磁盘满。构建脚本现在会检测 TEMP 剩余空间，不足时自动切到空间足够的盘（实测 C 盘只剩 6.5MB 时触发） |
+| `gcc.exe: fatal error: cannot execute '.../as.exe': CreateProcess: No such file or directory` | 看着像编译器缺文件，**实际是内存不足**：scons 默认按 CPU 核数并行，12 核机器可用内存只有 5GB 时，十几个 cc1 一起跑会开不出子进程。构建脚本现在按可用内存自动下调 `--jobs`（留 25% 余量，每进程按 900MB 估） |
 | 编译期间机器很卡 | 杀软的实时扫描会逐个检查生成的 .o/.exe。把项目目录、`.nuitka_cache` 加入信任区能明显加速 |
 
 > 首次构建需要下载约 255MB 的 MinGW 工具链并编译 Nuitka 的静态运行库，

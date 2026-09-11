@@ -116,6 +116,106 @@ def check_compiler_cache():
         print(f"  [OK] 已清理 {cleaned} 个损坏的缓存包\n")
     return cleaned
 
+def ensure_temp_space(required_mb=2000):
+    """确保编译有足够的临时空间，不足时自动把 TEMP 切到其他盘。
+
+    事故背景：gcc 链接大量目标文件时要写"响应文件"，临时盘写满时报错是
+        gcc.exe: fatal error: could not write to temporary response file ...
+    完全看不出是磁盘满导致的（实测 C 盘只剩 6.5MB 时，772 个 C 文件的链接
+    就死在这一步）。这里提前检查并切换，避免这种误导性失败。
+    """
+    import string
+    import tempfile
+
+    tmp = tempfile.gettempdir()
+    try:
+        free_mb = shutil.disk_usage(tmp).free // (1024 * 1024)
+    except OSError:
+        free_mb = -1
+    if free_mb >= required_mb:
+        print(f"  [OK] 临时目录 {tmp}（剩余 {free_mb} MB）")
+        return None
+
+    print(f"  [WARN] 临时目录空间不足：{tmp} 仅剩 {free_mb} MB，"
+          f"编译约需 {required_mb} MB")
+    for letter in string.ascii_uppercase:
+        drive = f"{letter}:\\"
+        if not os.path.exists(drive):
+            continue
+        try:
+            free = shutil.disk_usage(drive).free // (1024 * 1024)
+        except OSError:
+            continue
+        if free < required_mb:
+            continue
+        new_tmp = os.path.join(drive, "fd_build_temp")
+        try:
+            os.makedirs(new_tmp, exist_ok=True)
+            probe = os.path.join(new_tmp, ".write_test")
+            with open(probe, "wb") as f:
+                f.write(b"ok")
+            os.remove(probe)
+        except OSError:
+            continue
+        os.environ["TMP"] = new_tmp
+        os.environ["TEMP"] = new_tmp
+        print(f"  [OK] 编译临时目录已切换到 {new_tmp}（剩余 {free} MB）")
+        print("       （gcc/Nuitka 的中间文件都会落在那里，构建完可手动删除）")
+        return new_tmp
+
+    print("  [FAIL] 没有找到空间足够（≥%d MB）的磁盘，请先清理磁盘再构建" % required_mb)
+    return None
+
+def available_memory_mb():
+    """当前可用物理内存（MB）；取不到返回 None"""
+    try:
+        import ctypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemStatus()
+        status.dwLength = ctypes.sizeof(_MemStatus)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return status.ullAvailPhys // (1024 * 1024)
+    except Exception:
+        return None
+
+
+def memory_aware_jobs(per_job_mb=900, reserve_ratio=0.75):
+    """按可用内存决定并行编译数。
+
+    事故背景：scons 默认按 CPU 核数并行。12 核机器、可用内存只有 5GB 时，
+    同时跑十几个 cc1（PyQt5 那些大 .c 单个就要几百 MB）会把内存吃光，
+    而 gcc 此时报的错却是：
+        gcc.exe: fatal error: cannot execute '.../as.exe':
+            CreateProcess: No such file or directory
+    看起来像编译器缺文件，其实是开不出子进程。这里按内存留出余量，
+    宁可用少一点的并行度换稳定。
+    """
+    cpus = os.cpu_count() or 4
+    avail = available_memory_mb()
+    if not avail:
+        print(f"  [OK] 并行编译数: {cpus}（未能读取内存信息，按 CPU 核数）")
+        return cpus
+    budget = int(avail * reserve_ratio)
+    by_memory = max(1, budget // per_job_mb)
+    jobs = max(1, min(cpus, by_memory))
+    note = "" if jobs == cpus else "（按可用内存下调，避免编译时内存耗尽）"
+    print(f"  [OK] 并行编译数: {jobs}{note}　[CPU {cpus} 核 / 可用内存 {avail} MB]")
+    return jobs
+
 def metadata_flags():
     """Windows 版本资源（产品名/公司/版本/版权/图标）。
 
@@ -150,6 +250,7 @@ def build_main():
     """
     print("=== Building main.exe (standalone, all modules embedded) ===")
     check_compiler_cache()
+    ensure_temp_space()
     DIST_MAIN.mkdir(parents=True, exist_ok=True)
 
     cmd = (
@@ -159,6 +260,7 @@ def build_main():
         f' --windows-console-mode=disable'
         f' --output-dir="{DIST}"'
         f'{metadata_flags()}'
+        f' --jobs={memory_aware_jobs()}'
         f' "{ROOT / "main.py"}"'
     )
     run(cmd, "main.exe")
