@@ -28,32 +28,65 @@ EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
 
-def attach_console():
-    """Windows 上把无控制台的 GUI 程序挂到父进程控制台，让 print 能显示出来。
+def _rebind_stream(name, fd_index):
+    """把 sys.<name> 接到一个真正可用的输出上。
 
-    从资源管理器双击（没有父控制台）时挂接会失败，此时保持静默——那种情况下
-    本来就应该走 GUI。"""
-    if os.name != 'nt':
+    为什么需要这么绕：Nuitka 用 --windows-console-mode=disable 编译出来的程序
+    属于 GUI 子系统，启动时 sys.stdout 可能是 None —— 此时 print() 会**静默**
+    丢弃，表现为"命令跑完了、退出码 0、但一个字都没有输出"。
+
+    顺序很重要：
+      1. 原来的流还能写 -> 保持不动（cmd 的 > 重定向要靠它）
+      2. 原始文件描述符 -> 覆盖输出被重定向到文件/管道的情况
+      3. 打开 CONOUT$   -> 直接连到调用者的控制台
+    """
+    current = getattr(sys, name, None)
+    if current is not None and not getattr(current, "closed", True):
+        try:
+            current.write("")
+            current.flush()
+            return True
+        except Exception:
+            pass
+    try:
+        stream = os.fdopen(fd_index, "w", encoding="utf-8", errors="replace",
+                           buffering=1, closefd=False)
+        stream.write("")
+        stream.flush()
+        setattr(sys, name, stream)
+        return True
+    except Exception:
+        pass
+    try:
+        stream = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+        setattr(sys, name, stream)
+        return True
+    except OSError:
         return False
+
+
+def attach_console():
+    """让没有控制台的打包版程序把输出交给调用它的 shell。
+
+    从资源管理器双击（没有父控制台）时挂接会失败，那种情况本来就该走 GUI。
+    """
+    if os.name != "nt":
+        return False
+    attached = False
     try:
         import ctypes
         ATTACH_PARENT_PROCESS = -1
-        if not ctypes.windll.kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
-            return False
-        for name in ('stdout', 'stderr'):
-            try:
-                stream = open('CONOUT$', 'w', encoding='utf-8', errors='replace', buffering=1)
-            except OSError:
-                continue
-            setattr(sys, name, stream)
-        try:
-            sys.stdin = open('CONIN$', 'r', encoding='utf-8', errors='replace')
-        except OSError:
-            pass
-        return True
+        attached = bool(ctypes.windll.kernel32.AttachConsole(ATTACH_PARENT_PROCESS))
     except Exception:
-        return False
-
+        attached = False
+    ok_out = _rebind_stream("stdout", 1)
+    ok_err = _rebind_stream("stderr", 2)
+    try:
+        if not getattr(sys, "stdin", None):
+            sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    return attached or ok_out or ok_err
 
 def build_parser():
     p = argparse.ArgumentParser(
