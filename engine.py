@@ -6,6 +6,7 @@ import os
 import json
 import re
 import errno
+import hashlib
 import random
 import shutil
 import traceback
@@ -93,6 +94,35 @@ class TokenBucket:
             time.sleep(min(need, 0.2))
 
 
+def file_sha256(path, chunk_size=1 << 20, progress=None):
+    """计算文件 SHA256（十六进制小写）。progress 可选，回调 (已读字节, 总字节)"""
+    total = 0
+    try:
+        total = os.path.getsize(path)
+    except OSError:
+        pass
+    h = hashlib.sha256()
+    done = 0
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(chunk_size), b''):
+            h.update(block)
+            done += len(block)
+            if progress is not None:
+                try:
+                    progress(done, total)
+                except Exception:
+                    pass
+    return h.hexdigest()
+
+
+def looks_like_sha256(text):
+    """从文本中提取第一个 64 位十六进制哈希（用于解析 .sha256 校验文件）"""
+    if not text:
+        return ''
+    m = re.search(r'\b([0-9a-fA-F]{64})\b', text)
+    return m.group(1).lower() if m else ''
+
+
 def _is_loopback(url):
     """判断是否指向本机（127.0.0.0/8 / localhost / ::1）"""
     try:
@@ -120,7 +150,7 @@ class DownloadTask:
                  proxy='', headers=None, retry_count=3, retry_backoff=1.0,
                  connect_timeout=15, read_timeout=30, verify_ssl=False,
                  conflict_policy='rename', check_disk_space=True, min_free_mb=100,
-                 cookie_mode='auto'):
+                 cookie_mode='auto', expected_sha256='', sha256_auto_probe=True):
         self.task_id = task_id
         self.url = url
         self.save_path = save_path
@@ -145,6 +175,12 @@ class DownloadTask:
         mode = str(cookie_mode or 'auto').lower()
         self.cookie_mode = mode if mode in ('auto', 'always', 'off') else 'auto'
         self._cookies_loaded = False
+        # SHA256 校验：expected_sha256 为用户/调用方给出的期望值；
+        # 为空且允许探测时，会尝试下载 <url>.sha256 / .sha256sum（很多项目都会附带）
+        given = str(expected_sha256 or '').strip().lower()
+        self.expected_sha256 = given if re.fullmatch(r'[0-9a-f]{64}', given) else ''
+        self.sha256_auto_probe = bool(sha256_auto_probe) and not self.expected_sha256
+        self.file_hash = ''          # 完成后实际算出的哈希
         # 开始时目标文件是否已存在（覆盖策略或断点续传时，它就是我们要替换的文件）
         self._target_owned = False
         self.total_size = 0
@@ -297,6 +333,56 @@ class DownloadTask:
         log(f'目标已存在，自动重命名: {path} -> {new_path}')
         self.save_path = new_path
         return True
+
+    # ---- SHA256 校验 ----
+
+    def _probe_expected_hash(self):
+        """尝试从服务器取 <url>.sha256 / .sha256sum 里的期望哈希。
+
+        探测失败/不存在就静默跳过，不影响下载；本机地址直接跳过以省一次请求。
+        """
+        if self.expected_sha256 or not self.sha256_auto_probe:
+            return
+        if _is_loopback(self.url):
+            return
+        for suffix in ('.sha256', '.sha256sum'):
+            try:
+                resp = self._get(self.url + suffix, timeout=8)
+            except Exception as e:
+                log(f'SHA256 探测 {suffix} 失败: {e}')
+                return
+            try:
+                if resp.status_code != 200:
+                    # 常见约定是 <文件>.sha256；该文件不存在就别再试后面的后缀了
+                    if resp.status_code in (403, 404, 410):
+                        return
+                    continue
+                found = looks_like_sha256(resp.text[:4096] if hasattr(resp, 'text') else '')
+                if found:
+                    self.expected_sha256 = found
+                    log(f'从 {suffix} 获取到期望 SHA256: {found}')
+                    return
+                log(f'{suffix} 内容里没有找到 SHA256，忽略')
+                return
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+    def _verify_hash(self, path):
+        """校验文件哈希；不匹配时抛异常（调用方负责把它变成任务错误）"""
+        if not self.expected_sha256:
+            return ''
+        log('SHA256 计算中...')
+        actual = file_sha256(path)
+        self.file_hash = actual
+        if actual.lower() != self.expected_sha256:
+            raise RuntimeError(
+                f'SHA256 校验失败：期望 {self.expected_sha256}，实际 {actual}'
+                f'（文件未通过校验，已保留 .part 便于重下或排查）')
+        log(f'SHA256 校验通过: {actual}')
+        return actual
 
     # ---- 磁盘空间 ----
 
@@ -469,6 +555,9 @@ class DownloadTask:
                 self._notify('error', f'无法创建目录: {e}')
                 log(f'创建目录异常: {traceback.format_exc()}')
                 return
+
+        # 顺便找一下服务器有没有提供 SHA256 校验文件
+        self._probe_expected_hash()
 
         # 文件名冲突：按策略处理（重命名 / 覆盖 / 跳过）
         # 注意 overwrite 是旧接口参数，默认 True；它不再改写策略，
@@ -895,6 +984,9 @@ class DownloadTask:
                     if actual != self.total_size:
                         raise RuntimeError(
                             f'文件不完整：期望{self.total_size}字节，实际{actual}字节')
+
+                # SHA256 校验放在改名之前：不通过就不产出最终文件，.part 保留
+                self._verify_hash(temp)
 
                 # 目标已存在时：属于我们自己的（覆盖策略 / 断点续传）就替换它，
                 # 是下载期间被别人新建的则另存，别把别人的文件删了。

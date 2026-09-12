@@ -119,6 +119,28 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        # 校验文件端点：/file.sha256 -> 返回 payload 的哈希（模拟项目的校验文件约定）
+        if path.endswith('.sha256'):
+            # 只有 /file 附带校验文件；其他路径返回 404，模拟“服务器没有校验文件”
+            if path != '/file.sha256':
+                self.send_response(404)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            import hashlib as _hl
+            body = (_hl.sha256(self.payload).hexdigest() + '  payload.bin\n').encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path.endswith('.sha256sum'):
+            body = b'not a hash here\n'
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         qs = parse_qs(parsed.query)
         state = self._state()
 

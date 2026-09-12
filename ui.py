@@ -1,11 +1,12 @@
-import os, json, time, threading, urllib.parse, socket
+import os, json, time, threading, urllib.parse, socket, re
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 from PyQt5.QtCore import pyqtSignal
 
 from engine import DownloadTask
-from utils import format_size, format_time
+from utils import (format_size, format_time, _sanitize_filename,
+                   _extract_filename, _default_save_path)
 from settings import Settings
 from clipboard_watcher import ClipboardWatcher
 from remote_browser import RemoteServer, load_servers, save_servers
@@ -40,47 +41,6 @@ CATEGORY_EXTS = {
     'programs': ['.exe','.msi','.dmg','.appimage','.deb','.rpm','.apk'],
     'compressed': ['.zip','.rar','.7z','.tar','.gz','.bz2','.xz','.zst','.iso'],
 }
-
-def _sanitize_filename(name):
-    """过滤 Windows 文件名非法字符（<>:"/ 竖线 ?* 和控制字符），防止路径注入"""
-    name = name.strip().strip('.')
-    invalid = '<>:"/\\|?*'
-    name = ''.join(c for c in name if c not in invalid and ord(c) >= 32)
-    return name or 'download'
-
-
-def _default_save_path(base_dir, url):
-    """按默认下载目录 + 链接推断保存路径。
-
-    链接能识别出文件名时返回 目录/文件名，否则返回目录本身
-    （引擎在保存路径是目录时会自动补文件名）。
-    """
-    base = os.path.normpath(base_dir or os.path.expanduser('~'))
-    url = (url or '').strip()
-    if url.lower().startswith(('http://', 'https://', 'ftp://', 'ftps://')):
-        name = _extract_filename(url)
-        if name:
-            return os.path.normpath(os.path.join(base, name))
-    return base
-
-
-def _extract_filename(url):
-    parsed = urllib.parse.urlparse(url)
-    params = urllib.parse.parse_qs(parsed.query)
-    for key in ('response-content-disposition', 'rscd', 'filename', 'download_fname'):
-        if key in params:
-            val = urllib.parse.unquote(params[key][0])
-            if 'filename=' in val:
-                val = val.split('filename=')[-1].split(';')[0].strip('"\' ')
-            val = _sanitize_filename(val)
-            if val:
-                return val
-    filename = urllib.parse.unquote(url.rstrip('/').split('/')[-1].split('?')[0]) or 'download'
-    filename = _sanitize_filename(filename)
-    if '.' not in filename:
-        filename += '.bin'
-    return filename
-
 
 class ProgressDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
@@ -588,14 +548,16 @@ class MainWindow(QMainWindow):
             check_disk_space=s.check_disk_space,
             min_free_mb=s.min_free_mb,
             cookie_mode=s.cookie_mode,
+            sha256_auto_probe=getattr(s, 'sha256_auto_probe', True),
         )
 
-    def _add_task(self, url, save_path, priority=0, start_now=True):
+    def _add_task(self, url, save_path, priority=0, start_now=True, expected_sha256=''):
         tid = self.next_id
         self.next_id += 1
         save_path = os.path.normpath(save_path)
         task = DownloadTask(tid, url, save_path,
-                            overwrite=True, **self._task_config())
+                            overwrite=True, expected_sha256=expected_sha256,
+                            **self._task_config())
         task.set_callback(self._on_task_event)
         task.priority = priority
         task.status = 'queued'
@@ -877,6 +839,12 @@ class MainWindow(QMainWindow):
         hint.setStyleSheet('color: #b8c4d0;')
         layout.addWidget(hint)
 
+        layout.addSpacing(6)
+        layout.addWidget(QLabel('校验 SHA256（可选）'))
+        sha_edit = QLineEdit()
+        sha_edit.setPlaceholderText('粘贴 64 位哈希；留空则自动尝试服务器上的 .sha256 文件')
+        layout.addWidget(sha_edit)
+
         # 用户手动改过路径后，就不再被链接变化覆盖
         manual = {'edited': False}
 
@@ -911,6 +879,8 @@ class MainWindow(QMainWindow):
             pass
         if clip.lower().startswith(('http://', 'https://', 'ftp://', 'ftps://')):
             url_edit.setText(clip)      # 触发 textChanged -> 填充默认路径
+        elif re.fullmatch(r'[0-9a-fA-F]{64}', clip):
+            sha_edit.setText(clip.lower())   # 剪贴板里是个哈希，直接填进校验框
         if not path_edit.text().strip():
             apply_default()
 
@@ -927,7 +897,11 @@ class MainWindow(QMainWindow):
             url = url_edit.text().strip()
             # 路径留空时回落到默认目录（引擎会按链接补文件名）
             path = path_edit.text().strip() or _default_path()
-            self._submit_task(dlg, url, path)
+            digest = sha_edit.text().strip().lower()
+            if digest and not re.fullmatch(r'[0-9a-f]{64}', digest):
+                QMessageBox.warning(dlg, '提示', 'SHA256 应该是 64 位十六进制字符，请检查后重试')
+                return
+            self._submit_task(dlg, url, path, expected_sha256=digest)
 
         ok.clicked.connect(submit)
         btn_layout.addWidget(ok)
@@ -935,9 +909,9 @@ class MainWindow(QMainWindow):
 
         dlg.exec_()
 
-    def _submit_task(self, dlg, url, path):
+    def _submit_task(self, dlg, url, path, expected_sha256=''):
         if url and path:
-            self._add_task(url, path)
+            self._add_task(url, path, expected_sha256=expected_sha256)
             dlg.accept()
 
     def _pick_directory(self, start=None, title='选择文件夹'):
@@ -1398,6 +1372,9 @@ class MainWindow(QMainWindow):
         disk_chk = QCheckBox('下载前检查磁盘剩余空间')
         disk_chk.setChecked(bool(self.settings.check_disk_space))
         f1.addRow(disk_chk)
+        sha_chk = QCheckBox('自动使用服务器上的 .sha256 校验下载结果')
+        sha_chk.setChecked(bool(getattr(self.settings, 'sha256_auto_probe', True)))
+        f1.addRow(sha_chk)
         update_chk = QCheckBox('启动时检查更新（GitHub Releases）')
         update_chk.setChecked(bool(getattr(self.settings, 'check_update_on_start', True)))
         f1.addRow(update_chk)
@@ -1491,6 +1468,7 @@ class MainWindow(QMainWindow):
             self.settings.min_free_mb = free_spin.value()
             self.settings.cookie_mode = cookie_combo.currentData()
             self.settings.check_update_on_start = update_chk.isChecked()
+            self.settings.sha256_auto_probe = sha_chk.isChecked()
             self.settings.save()
             self._apply_speed_to_tasks()   # 限速对运行中任务立即生效
             self._schedule()               # 并发上限调大时立即启动排队任务

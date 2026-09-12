@@ -22,6 +22,7 @@ DEFAULTS = {
     'check_disk_space': True,    # 下载前检查磁盘剩余空间
     'min_free_mb': 100,          # 磁盘保留安全余量（MB），低于该值时自动暂停
     'check_update_on_start': True,  # 启动时检查 GitHub Releases 是否有新版本
+    'sha256_auto_probe': True,   # 自动使用服务器上的 <文件>.sha256 校验下载结果
     'cookie_mode': 'auto',       # 浏览器 Cookie：auto 按需 / always 始终注入 / off 不使用
 }
 
@@ -59,7 +60,7 @@ def _clean(key, value):
             except (TypeError, ValueError):
                 return default
         return num if lo <= num <= hi else default
-    if key in ('verify_ssl', 'check_disk_space', 'check_update_on_start'):
+    if key in ('verify_ssl', 'check_disk_space', 'check_update_on_start', 'sha256_auto_probe'):
         return bool(value)
     if key == 'save_directory':
         if not isinstance(value, str) or not value.strip():
