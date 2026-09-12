@@ -196,6 +196,56 @@ class ApplyScriptTest(unittest.TestCase):
         self.assertIn(os.path.join(target, 'main.exe'), text)   # 重启的是 main.exe
         self.assertIn('rmdir /s /q', text)
 
+    def test_script_never_probes_by_writing_the_target(self):
+        """曾经的写法 >>"%RESTART%" echo. 会真往 exe 里追加字节"""
+        exe = os.path.join(self.tmp, 'FastDownloader.exe')
+        script = updater.build_update_script(self.payload, kind='onefile', target=exe)
+        text = self._read(script)
+        self.assertNotIn('>>"%RESTART%" echo.', text)
+        self.assertIn('tasklist', text)          # 用进程检测代替写文件试探
+
+    def test_script_uses_atomic_replace(self):
+        """先写 .new 再 move /y：直接 copy 到被占用的目标会把它截断成半个文件"""
+        exe = os.path.join(self.tmp, 'FastDownloader.exe')
+        script = updater.build_update_script(self.payload, kind='onefile', target=exe)
+        text = self._read(script)
+        self.assertIn('%TARGET%.new', text)
+        self.assertIn('move /y', text)
+        # 复制到临时文件后、替换之前要有一次大小校验
+        self.assertIn('SIZE_NEW', text)
+
+    def test_script_gives_up_instead_of_forcing_copy(self):
+        """超时必须放弃：强行复制正在运行的程序只会得到残缺文件"""
+        exe = os.path.join(self.tmp, 'FastDownloader.exe')
+        script = updater.build_update_script(self.payload, kind='onefile', target=exe,
+                                             timeout_seconds=42)
+        text = self._read(script)
+        self.assertIn(':giveup', text)
+        self.assertIn('GEQ 42', text)
+        # 等待不能靠 timeout 命令：无控制台时它会立即返回，等待变成空转
+        self.assertNotIn('timeout /t', text)
+        self.assertIn('ping -n 2', text)
+
+    def test_failure_path_does_not_restart(self):
+        """失败还重启旧版本 = 用户看到反复弹更新提示"""
+        exe = os.path.join(self.tmp, 'FastDownloader.exe')
+        script = updater.build_update_script(self.payload, kind='onefile', target=exe)
+        text = self._read(script)
+        failed_at = text.index(':failed')
+        self.assertNotIn('start ""', text[failed_at:])
+
+    def test_script_lives_outside_the_work_dir(self):
+        """脚本若在 WORKDIR 里，删目录等于删自己，后面的行读不到"""
+        exe = os.path.join(self.tmp, 'FastDownloader.exe')
+        script = updater.build_update_script(self.payload, kind='onefile', target=exe)
+        work_dir = os.path.dirname(self.payload)
+        self.assertFalse(os.path.abspath(script).startswith(os.path.abspath(work_dir)))
+
+    def test_restart_happens_before_cleanup(self):
+        exe = os.path.join(self.tmp, 'FastDownloader.exe')
+        script = updater.build_update_script(self.payload, kind='onefile', target=exe)
+        text = self._read(script)
+        self.assertLess(text.index('start ""'), text.index('rmdir /s /q'))
     def test_script_can_skip_restart(self):
         exe = os.path.join(self.tmp, 'FastDownloader.exe')
         script = updater.build_update_script(self.payload, kind='onefile',

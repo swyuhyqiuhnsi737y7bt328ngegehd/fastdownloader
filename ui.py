@@ -1,4 +1,4 @@
-import os, json, time, threading, urllib.parse, socket, re
+import os, json, time, threading, urllib.parse, socket, re, tempfile
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
@@ -1482,10 +1482,10 @@ class MainWindow(QMainWindow):
 
     _KIND_LABELS = {'onefile': '单文件版', 'standalone': '目录版', 'source': '源码运行'}
 
-    def _show_update_dialog(self, release):
+    def _show_update_dialog(self, release, allow_auto=True):
         if getattr(self, '_update_dlg', None) is not None:
             return
-        dlg = self._build_update_dialog(release)
+        dlg = self._build_update_dialog(release, allow_auto=allow_auto)
         self._update_dlg = dlg
         try:
             dlg.exec_()
@@ -1493,8 +1493,12 @@ class MainWindow(QMainWindow):
             self._update_dlg = None
             self._update_bar = None
 
-    def _build_update_dialog(self, release):
-        """构建更新对话框（不执行 exec_，便于测试）"""
+    def _build_update_dialog(self, release, allow_auto=True):
+        """构建更新对话框（不执行 exec_，便于测试）
+
+        allow_auto=False 时禁用"下载并安装"：上次自动替换失败过，再点只会重复失败，
+        应该引导用户手动下载。
+        """
         dlg = QDialog(self)
         dlg.setWindowTitle('发现新版本')
         dlg.resize(580, 470)
@@ -1534,11 +1538,11 @@ class MainWindow(QMainWindow):
         later_btn = QPushButton('稍后')
         later_btn.clicked.connect(dlg.reject)
         btn_row.addWidget(later_btn)
-        install_btn = QPushButton('下载并安装')
+        install_btn = QPushButton('下载并安装' if allow_auto else '需手动下载（上次未成功）')
         install_btn.setStyleSheet('QPushButton { background: #2ecc71; color: white; padding: 6px 18px; border-radius: 3px; }')
         install_btn.clicked.connect(lambda: self._start_self_update(dlg, release))
         btn_row.addWidget(install_btn)
-        if not asset_name:
+        if not asset_name or not allow_auto:
             install_btn.setEnabled(False)
         layout.addLayout(btn_row)
         return dlg
@@ -1735,14 +1739,27 @@ class MainWindow(QMainWindow):
         if release is None:
             return
         if not has_update:
+            # 已经是最新版本：若之前记录过"更新尝试"，说明那次成功了，清理掉
+            updater.clear_update_attempt()
             if not silent:
                 QMessageBox.information(self, '检查更新',
                                         f'当前已是最新版本 v{__version__}')
             self.status_label.setText(f'已是最新版本 v{__version__}')
             return
-        self.status_label.setText(f'发现新版本 {release["tag"]}')
-        self._show_update_dialog(release)
 
+        # 上次尝试更新到这个版本却没成功（程序仍是旧版本）：
+        # 不能再让用户点"下载并安装"——替换失败时那就是"反复弹窗、反复失败"的死循环。
+        failed = updater.failed_attempt_tag()
+        blocked = bool(failed) and updater.parse_version(failed) == release.get('version')
+        self.status_label.setText(f'发现新版本 {release["tag"]}')
+        if blocked and not silent:
+            log_path = os.path.join(tempfile.gettempdir(), 'fd_update.log')
+            QMessageBox.warning(
+                self, '上次自动更新未成功',
+                f'上次尝试更新到 {failed} 没有成功，当前仍是 v{__version__}。'
+                '\n\n为避免反复失败，本次不再自动替换。'
+                '\n请从发布页面手动下载覆盖，或查看更新日志：\n' + log_path)
+        self._show_update_dialog(release, allow_auto=not blocked)
     def show_about(self):
         text = ("⚡ 极速下载器 Pro - Fast Downloader Pro  v" + __version__ + "\n\n"
                 "▸ 多线程并发下载\n▸ 浏览器 Cookie 导入\n"

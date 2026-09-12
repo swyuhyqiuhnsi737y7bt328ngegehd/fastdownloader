@@ -15,6 +15,7 @@ import tempfile
 import time
 import zipfile
 
+from paths import data_file
 from version import __version__, RELEASES_API, RELEASES_PAGE
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -279,57 +280,111 @@ def prepare_update(release, kind=None, work_dir=None, progress=None):
 
 # ---------------------------------------------------------------- 应用更新
 
-def build_update_script(payload, kind=None, target=None, restart=True, log_path=None):
+def build_update_script(payload, kind=None, target=None, restart=True, log_path=None,
+                        timeout_seconds=180):
     """生成后台替换脚本（.bat）。
 
-    脚本做四件事：等本程序退出 -> 复制新文件 -> 清理临时目录 -> 重启新版本。
-    之所以不在 Python 里直接替换：正在运行的 exe 在 Windows 上被锁定，
-    必须等进程结束后由别的进程来做。
+    脚本流程：等旧进程退出 -> 复制新文件 -> 校验大小 -> 清理 -> 重启。
+    正在运行的 exe 在 Windows 上被锁定，所以替换必须等进程结束、由独立进程完成。
+
+    三条硬性约束，每一条都来自实际事故：
+      1. 绝不通过写入目标 exe 来试探占用 —— 那会真往程序文件里追加字节；
+         改用 tasklist 判断进程是否存在。
+      2. 超时后必须放弃，不能强行复制 —— 覆盖正在运行的程序只会留下残缺文件
+         （表现为"只复制了几 MB、双击打不开"）。
+      3. 复制后校验大小，失败要保留现场且不重启 —— 否则脚本一边报错一边把旧
+         版本拉起来，用户看到的是"更新点了没反应、还反复提示更新"。
     """
     kind = kind or detect_install_kind()
     target = target or install_root(kind)
-    log_path = log_path or os.path.join(os.path.dirname(payload), 'update.log')
+    # Keep the log OUTSIDE the work dir: the script deletes that dir at the end,
+    # so a log living inside it would be gone exactly when an update fails.
+    log_path = log_path or os.path.join(tempfile.gettempdir(), 'fd_update.log')
     restart_exe = target if kind == 'onefile' else os.path.join(target, 'main.exe')
     work_dir = os.path.dirname(payload)
+    exe_name = os.path.basename(restart_exe)
+
+    if kind == 'onefile':
+        files = [f for f in os.listdir(payload)
+                 if os.path.isfile(os.path.join(payload, f))]
+        if not files:
+            raise RuntimeError('更新包为空，无法生成替换脚本')
+        src_file = os.path.join(payload, files[0])
+    else:
+        src_file = os.path.join(payload, 'main.exe')
 
     lines = [
         '@echo off',
-        'setlocal',
-        f'set "PAYLOAD={payload}"',
-        f'set "TARGET={target}"',
-        f'set "WORKDIR={work_dir}"',
-        f'set "LOG={log_path}"',
-        f'set "RESTART={restart_exe}"',
+        'setlocal enabledelayedexpansion',
+        'set "PAYLOAD=' + payload + '"',
+        'set "SRC=' + src_file + '"',
+        'set "TARGET=' + target + '"',
+        'set "WORKDIR=' + work_dir + '"',
+        'set "LOG=' + log_path + '"',
+        'set "RESTART=' + restart_exe + '"',
+        'set "EXENAME=' + exe_name + '"',
         'echo [%date% %time%] update start > "%LOG%"',
         '',
-        'rem --- 等待本程序退出（尝试写入目标文件，失败说明仍被占用） ---',
-        ':wait',
-        'set WAITED=0',
+        'rem ---- 1) 等旧进程退出（只查进程，不碰目标文件） ----',
+        'set /a WAITED=0',
         ':waitloop',
-        '2>nul (>>"%RESTART%" echo.) && goto copy',
+        'tasklist /fi "IMAGENAME eq %EXENAME%" 2>nul | find /i "%EXENAME%" >nul',
+        'if errorlevel 1 goto install',
         'set /a WAITED+=1',
-        'if %WAITED% GTR 60 goto copy',
-        'timeout /t 1 /nobreak >nul',
+        'if !WAITED! GEQ ' + str(timeout_seconds) + ' goto giveup',
+        'ping -n 2 127.0.0.1 >nul',
         'goto waitloop',
         '',
-        ':copy',
+        ':giveup',
+        'echo [%date% %time%] 旧进程超时未退出，放弃更新（目标文件未改动） >> "%LOG%"',
+        'exit /b 1',
+        '',
+        ':install',
         'echo [%date% %time%] copying >> "%LOG%"',
     ]
+
     if kind == 'onefile':
         lines += [
-            'copy /y "%PAYLOAD%\\*" "%TARGET%" >> "%LOG%" 2>&1',
+            'rem 源文件大小（后面两处校验都要用）',
+            'for %%A in ("%SRC%") do set "SIZE_SRC=%%~zA"',
+            'rem 先复制到同目录的临时文件并校验，再用 move /y 原子替换。',
+            'rem 直接 copy 到被占用的目标会先把它截断，失败后只剩半个文件 ——',
+            'rem 那正是"更新后只能复制几 MB、程序打不开"的原因。',
+            'copy /y "%SRC%" "%TARGET%.new" >> "%LOG%" 2>&1',
+            'if errorlevel 1 goto failed',
+            'for %%A in ("%TARGET%.new") do set "SIZE_NEW=%%~zA"',
+            'if not "%SIZE_SRC%"=="%SIZE_NEW%" (',
+            '    echo [%date% %time%] 临时文件大小不一致，放弃更新 >> "%LOG%"',
+            '    del "%TARGET%.new" >nul 2>&1',
+            '    goto failed',
+            ')',
+            'move /y "%TARGET%.new" "%TARGET%" >> "%LOG%" 2>&1',
+            'if errorlevel 1 (',
+            '    echo [%date% %time%] 替换失败（目标仍被占用），原文件未改动 >> "%LOG%"',
+            '    del "%TARGET%.new" >nul 2>&1',
+            '    goto failed',
+            ')',
         ]
     else:
         lines += [
-            'rem 目录版：整体覆盖安装目录（/e 含子目录，/y 不询问）',
-            'xcopy /y /e /i /q "%PAYLOAD%\\*" "%TARGET%" >> "%LOG%" 2>&1',
+            'rem 目录版：整体覆盖安装目录（/e 含子目录、/i 按目录处理、/y 不询问）',
+            r'xcopy /y /e /i /q "%PAYLOAD%\*" "%TARGET%\" >> "%LOG%" 2>&1',
+            'if errorlevel 1 goto failed',
         ]
+
     lines += [
         '',
-        'echo [%date% %time%] cleanup >> "%LOG%"',
-        'rmdir /s /q "%WORKDIR%" >nul 2>&1',
+        'rem ---- 2) 校验大小：不一致说明没复制完整 ----',
+        'for %%A in ("%SRC%") do set "SIZE_SRC=%%~zA"',
+        'for %%A in ("%TARGET%") do set "SIZE_DST=%%~zA"',
+        'if not "%SIZE_SRC%"=="%SIZE_DST%" (',
+        '    echo [%date% %time%] 大小不一致 %SIZE_SRC% != %SIZE_DST%，更新失败 >> "%LOG%"',
+        '    goto failed',
+        ')',
         '',
+        'echo [%date% %time%] ok >> "%LOG%"',
     ]
+
     if restart:
         lines += [
             'echo [%date% %time%] restart >> "%LOG%"',
@@ -337,13 +392,25 @@ def build_update_script(payload, kind=None, target=None, restart=True, log_path=
         ]
     else:
         lines.append('echo [%date% %time%] no restart >> "%LOG%"')
+
+    # 清理放在重启之后：脚本不在 WORKDIR 内，清理失败也不影响重启
     lines += [
-        'endlocal',
+        'echo %TARGET% | find /i "%WORKDIR%" >nul',
+        'if errorlevel 1 rmdir /s /q "%WORKDIR%" >nul 2>&1',
         'exit /b 0',
         '',
+        ':failed',
+        'rem 失败时保留临时文件、并且不重启：否则旧版本又跑起来、又提示更新，',
+        'rem 用户就会陷入"点了没反应、还一直弹窗"的循环。',
+        'echo [%date% %time%] 更新失败，临时文件保留在 %WORKDIR% >> "%LOG%"',
+        'exit /b 1',
+        '',
     ]
-    script_path = os.path.join(work_dir, 'apply_update.bat')
-    # 批处理用系统 ANSI 编码（中文系统为 GBK），避免 cmd 解析出错
+
+    # Script must not live in WORKDIR: it deletes that directory at the end,
+    # and a batch file deleting itself leaves cmd unable to read the rest of
+    # its lines - the restart never happened.
+    script_path = os.path.join(tempfile.gettempdir(), 'fd_apply_update.bat')
     encoding = 'mbcs' if os.name == 'nt' else 'utf-8'
     with open(script_path, 'w', encoding=encoding, errors='replace', newline='\r\n') as f:
         f.write('\n'.join(lines))
@@ -362,6 +429,45 @@ def launch_update_script(script_path):
     return True
 
 
+UPDATE_ATTEMPT_FILE = data_file('update_attempt.json')
+
+
+def record_update_attempt(tag):
+    """记录"正在尝试更新到 <tag>"。
+
+    替换是交给外部脚本做的：如果它失败了，程序重启后仍然是旧版本——不记一笔的话
+    启动检查又会发现"有新版本"，用户就会陷入反复弹窗、反复失败的循环。
+    """
+    try:
+        with open(UPDATE_ATTEMPT_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'tag': str(tag), 'at': time.time()}, f)
+    except OSError:
+        pass
+
+
+def clear_update_attempt():
+    try:
+        os.remove(UPDATE_ATTEMPT_FILE)
+    except OSError:
+        pass
+
+
+def failed_attempt_tag():
+    """上次尝试更新到的版本；若当前版本已经达到它，说明那次更新成功了（顺手清理）。"""
+    try:
+        with open(UPDATE_ATTEMPT_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return ''
+    tag = str(data.get('tag') or '')
+    if not tag:
+        return ''
+    if is_newer(tag, __version__):
+        return tag          # 比当前版本新 -> 说明没换成功
+    clear_update_attempt()  # 已经升上去了 -> 记录作废
+    return ''
+
+
 def self_update(release, kind=None, progress=None, restart=True):
     """完整流程：准备 -> 生成脚本 -> 启动脚本。调用方随后应退出程序。"""
     ok, reason = can_self_update(kind)
@@ -370,5 +476,6 @@ def self_update(release, kind=None, progress=None, restart=True):
     prepared = prepare_update(release, kind=kind, progress=progress)
     script = build_update_script(prepared['payload'], kind=prepared['kind'],
                                  restart=restart)
+    record_update_attempt(release.get('tag', ''))
     launch_update_script(script)
     return prepared
