@@ -24,6 +24,7 @@ Playwright 降级、断点续传、全局限速，深色现代 GUI。
 | Cookie 策略 | 浏览器 Cookie 默认按需读取（服务器要求认证时才碰浏览器数据），可关闭 |
 | SHA256 校验 | 下载后校验（可粘贴期望哈希，或自动读取服务器上的 `.sha256`），不通过不产出文件 |
 | 命令行模式 | `cli.py` 无图形界面依赖，支持多链接、并发、代理、JSON 输出，适合脚本/服务器 |
+| 插件系统 | DLL 插件，拖进窗口即安装；可挂钩 URL 改写、请求头、完成/失败事件 |
 | 令牌桶限速 | 全局速率精确可控，运行中可实时调整，不再受线程数影响 |
 | 剪贴板监控 | 复制 http(s) 链接时自动提示添加下载任务 |
 | 分类管理 | 视频 / 音乐 / 文档 / 程序 / 压缩包 / 未完成 / 已完成 + 关键词搜索 |
@@ -268,6 +269,8 @@ fastdownloader/
 ├── version.py              # 版本号与仓库地址
 ├── assets/app.ico          # 应用图标（构建时写入 exe 版本资源）
 ├── packaging/FIRST_RUN.txt # 随发布包分发的首次运行/白名单说明
+├── plugin_host.py          # 插件宿主（ctypes 加载 .dll 并调用钩子）
+├── plugins/                # 插件接口头文件与示例插件
 ├── updater.py              # 更新检查 / 下载校验 / 解压 / 后台替换
 ├── tests/                  # 测试（故障注入服务器 + 引擎/队列/GUI 测试）
 ├── requirements.txt        # Python 依赖
@@ -373,6 +376,58 @@ FastDownloader.exe --cli https://example.com/big.zip -o D:\\Downloads
 | 1 | 至少一个任务失败 |
 | 2 | 参数错误 |
 | 130 | 用户中断（Ctrl+C；`.part` 保留，可原命令续传） |
+
+## 🧩 插件
+
+插件是普通的 **DLL**：**把 .dll 拖进主窗口**就会提示确认、复制到插件目录，
+并在下次启动时自动加载。菜单 **插件 → 插件管理** 可以查看/停用/删除/重新加载，
+或直接打开插件目录。
+
+### 加载方式：稳定的 C 接口，不做注入
+
+主程序用 `ctypes` 按固定名字调用插件导出的 C 函数（接口见 `plugins/plugin_api.h`）。
+没有采用注入或 Python C 扩展，原因很实际：
+
+- 纯 C ABI **不依赖 Python 版本/ABI**，MSVC 与 MinGW 编出来的 DLL 都能直接用；
+- 插件出错只影响对应钩子的返回值，**不会把下载器带崩**；
+- 注入等于在主进程里跑任意代码，既没必要也难排查。
+
+> ⚠️ 插件本质是可执行代码。安装前的确认框会显示文件名、大小与 SHA256，
+> **只安装来源可信的 DLL**。
+
+### 可以挂的钩子
+
+| 导出函数 | 时机 | 用途举例 |
+|----------|------|----------|
+| `fd_plugin_api_version` | 加载时（**必须实现**） | 返回 `FD_PLUGIN_API_VERSION`，不匹配就拒绝加载 |
+| `fd_plugin_on_load` / `on_unload` | 生命周期 | 初始化、释放资源 |
+| `fd_plugin_on_url` | 任务创建前 | 改写链接（镜像、清洗跟踪参数），返回负数可拒绝该链接 |
+| `fd_plugin_on_headers` | 任务创建前 | 为特定站点追加 Referer / UA / Authorization |
+| `fd_plugin_on_task_start` | 开始下载 | 记账、限流 |
+| `fd_plugin_on_task_done` | 下载成功 | 归档、写数据库、系统通知 |
+| `fd_plugin_on_error` | 下载失败 | 告警、换源重试 |
+| `fd_plugin_on_progress` | 进度更新（高频，请自行节流） | 外部进度显示 |
+
+元信息（`fd_plugin_name` / `_version` / `_description` / `_author`）可选，会显示在插件管理里。
+
+### 示例插件
+
+`plugins/examples/` 里有三个可直接用也能当模板的插件（含预编译 DLL 与源码）：
+
+| 插件 | 作用 |
+|------|------|
+| `strip_tracking.dll` | 下载前去掉 `utm_*` / `fbclid` / `gclid` 等统计参数 |
+| `github_mirror.dll` | GitHub 下载直链走镜像（默认 `https://ghfast.top/`，可用环境变量 `FD_GITHUB_MIRROR` 更换或清空关闭） |
+| `task_logger.dll` | 每次下载成功追加一行到同目录的 `download_history.csv` |
+
+自己编译：
+
+```bat
+cd plugins\examples
+build_examples.bat        :: 需要 gcc 在 PATH 中
+```
+
+插件目录：源码运行是 `<项目>\plugins\`，打包版是 `%LOCALAPPDATA%\FastDownloader\plugins\`。
 
 ## 🛡 关于杀毒软件误报
 

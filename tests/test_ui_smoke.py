@@ -323,6 +323,53 @@ class SaveDirectoryTest(unittest.TestCase):
         self.assertIsNone(digest)
         self.assertIn('源码', info)
 
+    def test_plugin_manager_dialog_builds(self):
+        """插件管理窗口能构建（用 QTimer 自动关闭，不阻塞测试）"""
+        QTimer.singleShot(250, lambda: (_app.activeModalWidget().reject()
+                                        if _app.activeModalWidget() is not None else None))
+        self.win.plugin_manager_dialog()
+
+    def test_dragging_a_dll_asks_for_confirmation(self):
+        """拖入 DLL 必须先确认——插件是可执行代码"""
+        import plugin_host as ph
+        sandbox = tempfile.mkdtemp(prefix="fd_pluginstest_")
+        orig_dir = ph.PLUGIN_DIR
+        ph.PLUGIN_DIR = sandbox
+        asked = {"n": 0}
+
+        class _No:
+            Yes, No = 1, 0
+
+            @staticmethod
+            def question(*a, **k):
+                asked["n"] += 1
+                return 0                      # 用户点了"否"
+
+            @staticmethod
+            def information(*a, **k):
+                return 0
+
+            @staticmethod
+            def warning(*a, **k):
+                return 0
+
+        orig_box = ui_mod.QMessageBox
+        ui_mod.QMessageBox = _No
+        try:
+            src = os.path.join(tempfile.mkdtemp(), "x.dll")
+            with open(src, "wb") as f:
+                f.write(b"fake")
+            self.win._install_plugins([src])
+            self.assertEqual(asked["n"], 1, "应当弹确认框")
+            self.assertEqual(os.listdir(sandbox), [], "用户拒绝后不应安装")
+            self.win._install_plugins([os.path.join(tempfile.mkdtemp(), "note.txt")])
+            self.assertEqual(asked["n"], 1, "非 dll 不该弹框")
+        finally:
+            ui_mod.QMessageBox = orig_box
+            ph.PLUGIN_DIR = orig_dir
+            import shutil
+            shutil.rmtree(sandbox, ignore_errors=True)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

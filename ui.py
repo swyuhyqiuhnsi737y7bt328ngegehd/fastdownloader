@@ -11,6 +11,7 @@ from settings import Settings
 from clipboard_watcher import ClipboardWatcher
 from remote_browser import RemoteServer, load_servers, save_servers
 from task_store import save_tasks, load_tasks, restored_status
+import plugin_host
 import updater
 from version import __version__
 
@@ -99,6 +100,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("极速下载器 Pro")
         self.resize(1150, 720)
         self.setMinimumSize(900, 500)
+        self.setAcceptDrops(True)   # 拖入 .dll 即可安装插件
         self._setup_ui()
         self._setup_menu()
         self._timer = QTimer()
@@ -406,12 +408,166 @@ class MainWindow(QMainWindow):
 
         vm = bar.addMenu('查看')
         vm.addAction('搜索任务', self.focus_search, QKeySequence.Find)
+        pm = bar.addMenu('插件')
+        pm.addAction('插件管理', self.plugin_manager_dialog)
+        pm.addAction('打开插件目录', self.open_plugin_dir)
+        pm.addSeparator()
+        pm.addAction('重新加载插件', self.reload_plugins)
+
         hm = bar.addMenu('帮助')
         hm.addAction('检查更新', lambda: self.check_updates(silent=False))
         hm.addAction('打开发布页面', self.open_releases_page)
         hm.addAction('被杀软误报了？', self.show_av_help)
         hm.addSeparator()
         hm.addAction('关于', self.show_about)
+
+    # ---- 插件：拖拽安装与管理 ----
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for u in event.mimeData().urls():
+                if u.toLocalFile().lower().endswith('.dll'):
+                    event.acceptProposedAction()
+                    return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        paths = [u.toLocalFile() for u in event.mimeData().urls()]
+        dlls = [p for p in paths if p.lower().endswith('.dll')]
+        if not dlls:
+            super().dropEvent(event)
+            return
+        event.acceptProposedAction()
+        self._install_plugins(dlls)
+
+    def _install_plugins(self, paths):
+        """把拖进来的 DLL 安装为插件。插件是可执行代码，所以先让用户确认。"""
+        items = []
+        for path in paths:
+            try:
+                items.append((path, os.path.getsize(path), plugin_host.sha256_file(path)))
+            except OSError as e:
+                QMessageBox.warning(self, '无法读取', f'{path}\n{e}')
+        if not items:
+            return
+        detail = '\n'.join(
+            f'• {os.path.basename(p)}\n    {format_size(size)}    SHA256 {digest[:16]}…'
+            for p, size, digest in items)
+        answer = QMessageBox.question(
+            self, '安装插件',
+            f'即将安装 {len(items)} 个插件：\n\n{detail}\n\n'
+            f'安装目录：{plugin_host.plugin_dir()}\n\n'
+            '插件是能执行代码的 DLL，请确认来源可信后再继续。',
+            QMessageBox.Yes | QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        installed, failed = [], []
+        for path, _size, _digest in items:
+            dest, err = plugin_host.install_dll(path, overwrite=True)
+            (installed.append(os.path.basename(dest)) if dest
+             else failed.append(f'{os.path.basename(path)}: {err}'))
+        host = plugin_host.host()
+        host.load_all()
+        loaded = [p.name for p in host.plugins if p._lib is not None]
+        msg = []
+        if installed:
+            msg.append('已安装：' + ', '.join(installed))
+        if loaded:
+            msg.append('当前已加载：' + ', '.join(loaded))
+        if failed:
+            msg.append('失败：' + '; '.join(failed))
+        QMessageBox.information(self, '插件', '\n'.join(msg) or '没有变化')
+        self.status_label.setText(f'已加载 {len(loaded)} 个插件')
+
+    def plugin_manager_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle('插件管理')
+        dlg.resize(680, 460)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        layout.addWidget(QLabel('把 .dll 插件直接拖进主窗口即可安装\n'
+                               f'插件目录：{plugin_host.plugin_dir()}'))
+        table = QTreeWidget()
+        table.setHeaderLabels(['插件', '版本', '状态', '说明'])
+        table.setRootIsDecorated(False)
+        table.setColumnCount(4)
+        h = table.header()
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.resizeSection(1, 70)
+        h.resizeSection(2, 90)
+        h.setStretchLastSection(True)
+
+        def refresh():
+            table.clear()
+            for p in plugin_host.host().plugins:
+                if p._lib is None:
+                    state = '加载失败'
+                elif not p.enabled:
+                    state = '已停用'
+                else:
+                    state = '已启用'
+                desc = p.error or p.description or ''
+                item = QTreeWidgetItem(table, [p.name, p.version or '-', state, desc])
+                item.setData(0, Qt.UserRole, p.filename)
+            if table.topLevelItemCount() == 0:
+                QTreeWidgetItem(table, ['（还没有插件）', '', '', '把 .dll 拖进主窗口即可安装'])
+
+        refresh()
+        layout.addWidget(table, 1)
+
+        def selected_plugin():
+            item = table.currentItem()
+            if item is None:
+                return None
+            name = item.data(0, Qt.UserRole)
+            for p in plugin_host.host().plugins:
+                if p.filename == name:
+                    return p
+            return None
+
+        def toggle():
+            p = selected_plugin()
+            if p is None or p._lib is None:
+                return
+            p.enabled = not p.enabled
+            refresh()
+
+        def remove():
+            p = selected_plugin()
+            if p is None:
+                return
+            if QMessageBox.question(dlg, '删除插件',
+                                    f'确定删除 {p.filename} 吗？') != QMessageBox.Yes:
+                return
+            try:
+                os.remove(p.path)
+            except OSError as e:
+                QMessageBox.warning(dlg, '删除失败', str(e))
+                return
+            plugin_host.host().load_all()
+            refresh()
+
+        btn_row = QHBoxLayout()
+        open_btn = QPushButton('打开插件目录')
+        open_btn.clicked.connect(lambda: QDesktopServices.openUrl(
+            QUrl.fromLocalFile(plugin_host.plugin_dir())))
+        btn_row.addWidget(open_btn)
+        reload_btn = QPushButton('重新加载')
+        reload_btn.clicked.connect(lambda: (plugin_host.host().load_all(), refresh()))
+        btn_row.addWidget(reload_btn)
+        toggle_btn = QPushButton('启用/停用')
+        toggle_btn.clicked.connect(toggle)
+        btn_row.addWidget(toggle_btn)
+        del_btn = QPushButton('删除')
+        del_btn.clicked.connect(remove)
+        btn_row.addWidget(del_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton('关闭')
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        dlg.exec_()
 
     # ---- Category ----
 
@@ -552,12 +708,24 @@ class MainWindow(QMainWindow):
         )
 
     def _add_task(self, url, save_path, priority=0, start_now=True, expected_sha256=''):
+        # 插件钩子：允许改写链接（镜像/清洗参数）或直接拒绝
+        url, reject = plugin_host.host().transform_url(url)
+        if reject:
+            QMessageBox.warning(self, '插件拒绝了链接', reject)
+            return None
         tid = self.next_id
         self.next_id += 1
         save_path = os.path.normpath(save_path)
+        config = self._task_config()
+        # 插件钩子：允许为特定站点追加请求头（Referer/UA/Authorization 等）
+        extra = plugin_host.host().collect_headers(url)
+        if extra:
+            merged = dict(config.get('headers') or {})
+            merged.update(extra)
+            config['headers'] = merged
         task = DownloadTask(tid, url, save_path,
                             overwrite=True, expected_sha256=expected_sha256,
-                            **self._task_config())
+                            **config)
         task.set_callback(self._on_task_event)
         task.priority = priority
         task.status = 'queued'
@@ -668,6 +836,14 @@ class MainWindow(QMainWindow):
         """GUI 线程中处理任务事件（信号自动队列到主线程）"""
         if getattr(self, '_closing', False):
             return
+        if event == 'completed':
+            task = self.tasks.get(tid)
+            if task is not None:
+                plugin_host.host().notify('on_task_done',
+                                          task._final_path or task.save_path,
+                                          int(task.downloaded or 0),
+                                          task.file_hash or '')
+            return
         if event == 'skipped':
             QMessageBox.information(self, '已跳过', f'任务 {tid} 的目标文件已存在，按设置跳过下载:\n{data}')
             return
@@ -681,6 +857,7 @@ class MainWindow(QMainWindow):
             if getattr(task, '_error_notified', False):
                 return  # 同一任务只提示一次
             task._error_notified = True
+            plugin_host.host().notify('on_error', task.url, str(data))
             QMessageBox.critical(self, '下载错误', f'任务 {tid} 失败:\n{data}')
 
     def _tid_of(self, item):
@@ -1704,6 +1881,22 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
         return dlg
+
+    def open_plugin_dir(self):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(plugin_host.plugin_dir()))
+
+    def reload_plugins(self):
+        host = plugin_host.host()
+        host.load_all()
+        loaded = [p.name for p in host.plugins if p._lib is not None]
+        failed = [p for p in host.plugins if p._lib is None]
+        text = f'已加载 {len(loaded)} 个插件'
+        if loaded:
+            text += '：' + '、'.join(loaded)
+        if failed:
+            text += '\n失败：' + '；'.join(f'{p.filename} - {p.error}' for p in failed)
+        QMessageBox.information(self, '插件', text)
+        self.status_label.setText(f'已加载 {len(loaded)} 个插件')
 
     def open_releases_page(self):
         QDesktopServices.openUrl(QUrl(updater.RELEASES_PAGE))

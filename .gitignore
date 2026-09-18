@@ -21,5 +21,6 @@ build_nuitka/
 *.pyd
 *.pyi
 *.dll
+!plugins/examples/dist/*.dll
 *.exe
 *.zip
