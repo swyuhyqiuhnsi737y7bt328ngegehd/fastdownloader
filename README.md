@@ -518,4 +518,6 @@ Get-Process | Where-Object { $_.ProcessName -match '360|QQPC|ZhuDongFangYu|MsMpE
 
 ## 📄 License
 
-MIT
+本项目采用 **MIT 许可证**，完整条款见仓库根目录的 [LICENSE](LICENSE) 文件。
+
+Copyright (c) 2026 swyuhyqiuhnsi737y7bt328ngegehd

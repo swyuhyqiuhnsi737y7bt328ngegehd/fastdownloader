@@ -190,7 +190,7 @@ def metadata_flags():
         ' --file-description="Fast Downloader Pro - Multi-threaded Downloader"'
         f' --file-version={ver4}'
         f' --product-version={ver4}'
-        ' --copyright="MIT License"'
+        ' --copyright="Copyright (c) 2026 swyuhyqiuhnsi737y7bt328ngegehd (MIT)"'
     )
     icon = ROOT / 'assets' / 'app.ico'
     if icon.exists():
@@ -241,6 +241,14 @@ def cleanup_dist():
 README_NOTE_NAME = "安装说明（被杀软拦截请看这里）.txt"
 
 
+
+def ship_license(target_dir):
+    """把 LICENSE 一起打进发布目录（MIT 要求分发时附带许可声明）"""
+    src = ROOT / "LICENSE"
+    if src.exists() and Path(target_dir).is_dir():
+        shutil.copy2(src, Path(target_dir) / "LICENSE.txt")
+        print("  [OK] Shipped LICENSE.txt")
+
 def write_readme_note(target_dir):
     """把白名单/误报说明放进发布包：用户解压后第一眼就能看到。
 
@@ -258,6 +266,7 @@ def make_zip():
     zip_path = ROOT / ZIP_NAME
     print(f"=== Packaging -> {ZIP_NAME} ===")
     write_readme_note(DIST_MAIN)
+    ship_license(DIST_MAIN)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in DIST_MAIN.rglob("*"):
             if f.is_file() and "__pycache__" not in str(f):

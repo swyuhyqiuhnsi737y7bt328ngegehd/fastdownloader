@@ -1764,7 +1764,9 @@ class MainWindow(QMainWindow):
         text = ("⚡ 极速下载器 Pro - Fast Downloader Pro  v" + __version__ + "\n\n"
                 "▸ 多线程并发下载\n▸ 浏览器 Cookie 导入\n"
                 "▸ Playwright 浏览器降级\n▸ curl_cffi TLS 指纹模拟\n"
-                "▸ 断点续传 / 暂停 / 恢复\n▸ 批量下载 / 导出导入")
+                "▸ 断点续传 / 暂停 / 恢复\n▸ 批量下载 / 导出导入\n"
+                                "▸ SHA256 校验 / 命令行模式\n\n"
+                                "MIT License\nCopyright (c) 2026 swyuhyqiuhnsi737y7bt328ngegehd")
         QMessageBox.about(self, '关于 极速下载器 Pro', text)
 
     def on_clipboard_url(self, url):

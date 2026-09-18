@@ -45,7 +45,13 @@ Fast Downloader Pro —— 首次运行说明
     如果两者都报，优先用目录版。
 
 
-【5】提交误报，让厂商修掉（推荐）
+【5】许可证
+
+  本项目采用 MIT 许可证，完整条款见同目录下的 LICENSE.txt。
+  Copyright (c) 2026 swyuhyqiuhnsi737y7bt328ngegehd
+
+
+【6】提交误报，让厂商修掉（推荐）
 
   微软：https://www.microsoft.com/en-us/wdsi/filesubmission
   先上传 https://www.virustotal.com/ 看看是哪几家误报，申诉时附上更有效。

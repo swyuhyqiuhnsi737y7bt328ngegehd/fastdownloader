@@ -360,13 +360,21 @@ def metadata_flags():
         ' --file-description="Fast Downloader Pro - Multi-threaded Downloader"'
         f' --file-version={ver4}'
         f' --product-version={ver4}'
-        ' --copyright="MIT License"'
+        ' --copyright="Copyright (c) 2026 swyuhyqiuhnsi737y7bt328ngegehd (MIT)"'
     )
     icon = ROOT / 'assets' / 'app.ico'
     if icon.exists():
         flags += f' --windows-icon-from-ico="{icon}"'
     return flags
 
+
+
+def ship_license(target_dir):
+    """把 LICENSE 一起打进去（MIT 要求分发时附带许可声明）"""
+    src = ROOT / "LICENSE"
+    if src.exists() and Path(target_dir).is_dir():
+        shutil.copy2(src, Path(target_dir) / "LICENSE.txt")
+        print("  [OK] Shipped LICENSE.txt")
 
 def write_readme_note(target_dir):
     """把首次运行/白名单说明放进发布目录"""
@@ -541,6 +549,7 @@ def build_standalone_upx():
 
     print("\n=== Running UPX compression ===")
     write_readme_note(dist_dir)
+    ship_license(dist_dir)
     saved = compress_with_upx(dist_dir, upx_path)
 
     # ── 统计 ────────────────────────────────────────────
