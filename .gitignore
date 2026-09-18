@@ -15,7 +15,7 @@ fd_build_temp/
 *.onefile-build/
 main.dist/
 main.build/
-dist/
+/dist/
 build_c/
 build_nuitka/
 *.pyd
