@@ -226,9 +226,14 @@ python build.py --clean    # 清理所有构建产物
 | `gcc.exe: fatal error: could not write to temporary response file ...` | **临时目录所在盘没空间了**。链接阶段 gcc 要写响应文件，报错却完全看不出是磁盘满。构建脚本现在会检测 TEMP 剩余空间，不足时自动切到空间足够的盘（实测 C 盘只剩 6.5MB 时触发） |
 | `gcc.exe: fatal error: cannot execute '.../as.exe': CreateProcess: No such file or directory` | 看着像编译器缺文件，**实际是内存不足**：scons 默认按 CPU 核数并行，12 核机器可用内存只有 5GB 时，十几个 cc1 一起跑会开不出子进程。构建脚本现在按可用内存自动下调 `--jobs`（留 25% 余量，每进程按 900MB 估） |
 | 编译期间机器很卡 | 杀软的实时扫描会逐个检查生成的 .o/.exe。把项目目录、`.nuitka_cache` 加入信任区能明显加速 |
+| 编译了二十多分钟，**最后一步**才报 `PermissionError: [WinError 32] 另一个程序正在使用此文件`，或者干脆没有产物 | **旧的 `dist/FastDownloader.exe` 被占用**（打包好的程序还开着，或杀软正在扫描它）。以前 `clean()` 用 `ignore_errors=True` 把删除失败吞了，所以旧产物留在 `dist` 里，一直拖到最后替换 exe 时才炸。构建脚本现在会在**开始前**自检目标能否替换，被占用就直接说明原因并退出，不会白跑 |
+| 链接阶段很长一段时间没有任何输出，看着像卡死 | `--lto=yes`（默认）的链接本来就慢，实测光链接就约 4~5 分钟。**别用 `ld.exe` 的 CPU 判断死活**——它只是协调者，CPU 接近 0 是正常的，真正干活的是它拉起的 `lto1.exe`（每个 250~300MB）。用 `tasklist /FI "IMAGENAME eq lto1.exe"` 看到它在跑就说明一切正常 |
 
 > 首次构建需要下载约 255MB 的 MinGW 工具链并编译 Nuitka 的静态运行库，
 > 之后有缓存会快很多。产物在 `dist/` 下。
+>
+> ⚠️ 两个脚本开头的 `clean()` 都会**清空整个 `dist/`**，所以要两种产物的话，
+> 先构建完一个就把它拷出来（例如 `copy dist\FastDownloader.exe ..`），再跑另一个。
 ### 单文件版（`build_onefile.py`）
 
 打包为单个 `dist/FastDownloader.exe`，运行时自动解压到临时目录，双击即用：

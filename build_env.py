@@ -257,3 +257,71 @@ def ensure_compiler_archive():
     except OSError:
         pass
     return False
+
+
+# ---------------------------------------------------------------- 产物占用检查
+
+def running_processes(names):
+    """列出正在运行的同名进程（Windows），如 ['FastDownloader.exe (PID 1234)']。
+
+    为什么要在构建前查：程序还开着的时候，它的 exe 会被锁住，替换必然失败。
+    """
+    if os.name != 'nt':
+        return []
+    wanted = {str(n).lower() for n in names}
+    try:
+        result = subprocess.run(
+            ['tasklist', '/FO', 'CSV', '/NH'],
+            capture_output=True, text=True, timeout=20,
+            encoding='utf-8', errors='replace',
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in (result.stdout or '').splitlines():
+        fields = [f.strip().strip('"') for f in line.split('","')]
+        if len(fields) >= 2 and fields[0].lower() in wanted:
+            found.append(f"{fields[0]} (PID {fields[1]})")
+    return sorted(set(found))
+
+
+def locked_reason(path):
+    """路径能否被替换；不能则返回一句人话，能则返回 None。
+
+    为什么需要：clean() 用的是 shutil.rmtree(ignore_errors=True) 和
+    unlink(missing_ok=True)——删不掉也**不报错**。旧产物于是留在 dist 里，
+    等二十分钟编译结束、最后一步 os.replace() 才抛 PermissionError，
+    用户看到的只是"跑了半天没有结果"。提前试着重命名一次就能提前发现。
+    """
+    target = Path(path)
+    if not target.exists():
+        return None
+    probe = target.with_name(target.name + '.fdlock')
+    try:
+        os.replace(target, probe)
+        os.replace(probe, target)
+        return None
+    except OSError as exc:
+        try:
+            if probe.exists():
+                os.replace(probe, target)
+        except OSError:
+            pass
+        return f"{path} 无法替换（{exc.strerror or exc}）"
+
+
+def check_output_available(paths, process_names=()):
+    """构建开始前的占用自检。返回 True 可以继续；False 说明应先关掉程序。"""
+    problems = [msg for msg in (locked_reason(p) for p in paths) if msg]
+    running = running_processes(process_names)
+    if not problems and not running:
+        return True
+    print()
+    print("  [FAIL] 打包目标正被占用 —— 先关掉它们再重新构建，否则会白跑一趟：")
+    for item in running:
+        print(f"         - 程序还在运行：{item}")
+    for msg in problems:
+        print(f"         - {msg}")
+    print("         提示：刚关闭程序后杀毒软件可能仍在扫描该文件，等几秒再试。")
+    print()
+    return False

@@ -21,8 +21,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_env import (available_memory_mb, check_compiler_cache,  # noqa: E402
-                       ensure_compiler_archive, ensure_temp_space,
-                       memory_aware_jobs)
+                       check_output_available, ensure_compiler_archive,
+                       ensure_temp_space, memory_aware_jobs)
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -69,107 +69,30 @@ def run(cmd, label=""):
 def clean():
     print("=== Cleaning build artifacts ===")
     # 只清理构建产物；不碰项目根目录下的 *.pyd/*.dll/*.a（可能是用户自己的文件）
+    stuck = []
     for pattern in ["dist", "*.build", "build_c", "build_nuitka",
                      ".nuitka_cache", "__pycache__"]:
         for p in ROOT.glob(pattern):
-            if p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
-            else:
-                p.unlink(missing_ok=True)
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink(missing_ok=True)
+            except OSError as exc:
+                # 删不掉必须吭声，否则旧产物会留到构建最后一步才炸
+                stuck.append(f"{p}（{exc.strerror or exc}）")
     for p in ROOT.rglob("__pycache__"):
-        shutil.rmtree(p, ignore_errors=True)
+        try:
+            shutil.rmtree(p)
+        except OSError:
+            pass
+    if stuck:
+        print("  [WARN] 以下产物删不掉（多半是程序还开着），已跳过：")
+        for item in stuck:
+            print(f"         - {item}")
     print("  [OK] Cleaned\n")
 
 
-
-def check_compiler_cache():
-    """构建前扫一遍 Nuitka 的下载缓存，删掉损坏的压缩包。
-
-    事故背景：编译器包（约 255MB）下载中断时会留下一个"看起来有几十 MB、
-    实际是半截"的 zip。Nuitka 解压失败后 scons 会**一直挂着**——不报错、
-    不退出、CPU 也是 0，比直接失败难查得多（实测卡了 24 分钟没动静）。
-    这里提前发现并删除，让 Nuitka 重新下载。
-    """
-    roots = []
-    env_dir = os.environ.get("NUITKA_CACHE_DIR")
-    if env_dir:
-        roots.append(Path(env_dir))
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        roots.append(Path(local) / "Nuitka" / "Nuitka" / "Cache")
-    cleaned = 0
-    for root in roots:
-        downloads = root / "downloads"
-        if not downloads.is_dir():
-            continue
-        for archive_path in downloads.rglob("*.zip"):
-            try:
-                with zipfile.ZipFile(archive_path) as zf:
-                    if zf.testzip() is not None:
-                        raise zipfile.BadZipFile("CRC check failed")
-            except (zipfile.BadZipFile, OSError, EOFError):
-                size_mb = archive_path.stat().st_size / 1048576
-                print(f"  [WARN] 编译器缓存损坏（{size_mb:.1f}MB，下载不完整），已删除:")
-                print(f"         {archive_path}")
-                print("         Nuitka 会在构建时重新下载（约 255MB，请保持网络稳定）")
-                try:
-                    archive_path.unlink()
-                    cleaned += 1
-                except OSError:
-                    pass
-    if cleaned:
-        print(f"  [OK] 已清理 {cleaned} 个损坏的缓存包\n")
-    return cleaned
-
-def ensure_temp_space(required_mb=2000):
-    """确保编译有足够的临时空间，不足时自动把 TEMP 切到其他盘。
-
-    事故背景：gcc 链接大量目标文件时要写"响应文件"，临时盘写满时报错是
-        gcc.exe: fatal error: could not write to temporary response file ...
-    完全看不出是磁盘满导致的（实测 C 盘只剩 6.5MB 时，772 个 C 文件的链接
-    就死在这一步）。这里提前检查并切换，避免这种误导性失败。
-    """
-    import string
-    import tempfile
-
-    tmp = tempfile.gettempdir()
-    try:
-        free_mb = shutil.disk_usage(tmp).free // (1024 * 1024)
-    except OSError:
-        free_mb = -1
-    if free_mb >= required_mb:
-        print(f"  [OK] 临时目录 {tmp}（剩余 {free_mb} MB）")
-        return None
-
-    print(f"  [WARN] 临时目录空间不足：{tmp} 仅剩 {free_mb} MB，"
-          f"编译约需 {required_mb} MB")
-    for letter in string.ascii_uppercase:
-        drive = f"{letter}:\\"
-        if not os.path.exists(drive):
-            continue
-        try:
-            free = shutil.disk_usage(drive).free // (1024 * 1024)
-        except OSError:
-            continue
-        if free < required_mb:
-            continue
-        new_tmp = os.path.join(drive, "fd_build_temp")
-        try:
-            os.makedirs(new_tmp, exist_ok=True)
-            probe = os.path.join(new_tmp, ".write_test")
-            with open(probe, "wb") as f:
-                f.write(b"ok")
-            os.remove(probe)
-        except OSError:
-            continue
-        os.environ["TMP"] = new_tmp
-        os.environ["TEMP"] = new_tmp
-        print(f"  [OK] 编译临时目录已切换到 {new_tmp}（剩余 {free} MB）")
-        print("       （gcc/Nuitka 的中间文件都会落在那里，构建完可手动删除）")
-        return new_tmp
-
-    print("  [FAIL] 没有找到空间足够（≥%d MB）的磁盘，请先清理磁盘再构建" % required_mb)
-    return None
 
 def metadata_flags():
     """Windows 版本资源（产品名/公司/版本/版权/图标）。
@@ -301,6 +224,11 @@ def main():
     if "--clean" in args:
         clean()
         return
+
+    # 先确认产物没被占用，避免白跑一趟（详见 build_env.check_output_available）
+    if not check_output_available([DIST_MAIN / "main.exe"],
+                                  ["FastDownloader.exe", "main.exe"]):
+        sys.exit(1)
 
     if "--zip" in args:
         clean()
