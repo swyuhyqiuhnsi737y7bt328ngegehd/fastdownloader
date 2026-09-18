@@ -410,6 +410,7 @@ class MainWindow(QMainWindow):
         vm.addAction('搜索任务', self.focus_search, QKeySequence.Find)
         pm = bar.addMenu('插件')
         pm.addAction('插件管理', self.plugin_manager_dialog)
+        pm.addAction('插件说明', self.plugin_help_dialog)
         pm.addAction('打开插件目录', self.open_plugin_dir)
         pm.addSeparator()
         pm.addAction('重新加载插件', self.reload_plugins)
@@ -478,6 +479,42 @@ class MainWindow(QMainWindow):
             msg.append('失败：' + '; '.join(failed))
         QMessageBox.information(self, '插件', '\n'.join(msg) or '没有变化')
         self.status_label.setText(f'已加载 {len(loaded)} 个插件')
+
+    def plugin_help_dialog(self):
+        """插件使用与开发说明（内容随程序发布，插件目录里也有同一份）"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle('插件说明')
+        dlg.resize(780, 640)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        view = QPlainTextEdit(plugin_host.PLUGIN_HELP_TEXT)
+        view.setReadOnly(True)
+        view.setFont(QFont('Consolas', 9))
+        layout.addWidget(view, 1)
+
+        btn_row = QHBoxLayout()
+        help_btn = QPushButton('插件说明')
+        help_btn.clicked.connect(self.plugin_help_dialog)
+        btn_row.addWidget(help_btn)
+        open_btn = QPushButton('打开插件目录')
+        open_btn.clicked.connect(lambda: QDesktopServices.openUrl(
+            QUrl.fromLocalFile(plugin_host.plugin_dir())))
+        btn_row.addWidget(open_btn)
+
+        def copy_help():
+            QApplication.clipboard().setText(plugin_host.PLUGIN_HELP_TEXT)
+            QMessageBox.information(dlg, '已复制', '说明已复制到剪贴板')
+
+        copy_btn = QPushButton('复制说明')
+        copy_btn.clicked.connect(copy_help)
+        btn_row.addWidget(copy_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton('关闭')
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        dlg.exec_()
 
     def plugin_manager_dialog(self):
         dlg = QDialog(self)
@@ -549,6 +586,9 @@ class MainWindow(QMainWindow):
             refresh()
 
         btn_row = QHBoxLayout()
+        help_btn = QPushButton('插件说明')
+        help_btn.clicked.connect(self.plugin_help_dialog)
+        btn_row.addWidget(help_btn)
         open_btn = QPushButton('打开插件目录')
         open_btn.clicked.connect(lambda: QDesktopServices.openUrl(
             QUrl.fromLocalFile(plugin_host.plugin_dir())))

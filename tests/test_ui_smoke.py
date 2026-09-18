@@ -361,7 +361,8 @@ class SaveDirectoryTest(unittest.TestCase):
                 f.write(b"fake")
             self.win._install_plugins([src])
             self.assertEqual(asked["n"], 1, "应当弹确认框")
-            self.assertEqual(os.listdir(sandbox), [], "用户拒绝后不应安装")
+            installed = [f for f in os.listdir(sandbox) if f.lower().endswith(".dll")]
+            self.assertEqual(installed, [], "用户拒绝后不应安装")
             self.win._install_plugins([os.path.join(tempfile.mkdtemp(), "note.txt")])
             self.assertEqual(asked["n"], 1, "非 dll 不该弹框")
         finally:
